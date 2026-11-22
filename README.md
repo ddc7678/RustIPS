@@ -4,6 +4,9 @@ RustIPS is a small, fast intrusion prevention system for a **single**
 internet-facing Linux host. It watches packets, recognises the common
 automated attacks, and blocks the source address at the firewall.
 
+**Project website:** <https://rustips.tech/> — product overview, screenshots and
+the design story.
+
 This repository currently contains **0.3.14**: the packet sensor, web UI,
 journald ingestion, rules platform, HTTP detectors, GeoIP/ASN enrichment,
 webhook alerting, slow-scan detection, the full-detector coverage gate, the
