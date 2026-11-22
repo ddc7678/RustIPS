@@ -1,0 +1,56 @@
+name: Release binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run coverage scorecard
+        run: cargo test --test scorecard -- --nocapture
+
+      - name: Package binary and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN="rustips-${VERSION}-linux-x86_64"
+          mkdir -p dist
+          cp target/release/rustips "dist/${BIN}"
+          chmod 0755 "dist/${BIN}"
+          cp target/scorecard.json "dist/${BIN}-scorecard.json"
+          (cd dist && sha256sum "${BIN}" > "${BIN}.sha256")
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN="rustips-${VERSION}-linux-x86_64"
+          NOTES="docs/releases/${VERSION}.md"
+          if [ -f "$NOTES" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/${BIN}" "dist/${BIN}.sha256" "dist/${BIN}-scorecard.json" \
+              --title "RustIPS ${VERSION}" --notes-file "$NOTES" --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/${BIN}" "dist/${BIN}.sha256" "dist/${BIN}-scorecard.json" \
+              --title "RustIPS ${VERSION}" --generate-notes --prerelease
+          fi

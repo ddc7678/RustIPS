@@ -84,6 +84,24 @@ binary is about 6 MB. The full suite is 160 tests (146 library, 6 CLI
 first-run/recovery, 1 replay, 1 end-to-end web, 2 webhook delivery, 3 robustness,
 1 coverage scorecard).
 
+## Release binaries
+
+Tagged releases are published at
+<https://github.com/ddc7678/RustIPS/releases>. A `v*` tag triggers
+`.github/workflows/release.yml`, which builds the binary, runs the coverage
+scorecard, and attaches:
+
+- `rustips-<version>-linux-x86_64`
+- `rustips-<version>-linux-x86_64.sha256`
+- `rustips-<version>-linux-x86_64-scorecard.json`
+
+Verify and install:
+
+```sh
+sha256sum -c rustips-<version>-linux-x86_64.sha256
+sudo install -m 0755 rustips-<version>-linux-x86_64 /usr/local/bin/rustips
+```
+
 ## Quick start
 
 With only the binary copied to the host:

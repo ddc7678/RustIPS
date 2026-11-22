@@ -6,6 +6,12 @@ are fixes within an iteration.
 
 ## [Unreleased]
 
+### Added
+
+- GitHub release workflow for `v*` tags: builds the Linux x86_64 binary, runs
+  the coverage scorecard, and publishes the binary, checksum and scorecard as
+  release assets.
+
 ### Changed
 
 - Roadmap renumbered to stay on the 0.3.x line: rules platform 0.3.1,
