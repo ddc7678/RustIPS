@@ -1,0 +1,98 @@
+{
+  "benign_alerts": 0,
+  "benign_blocks": 0,
+  "corpus": "0.3.10",
+  "coverage_pct": 100.0,
+  "det18_ladder": true,
+  "detected": 21,
+  "detectors": [
+    {
+      "detected": true,
+      "detector": "DET-01"
+    },
+    {
+      "detected": true,
+      "detector": "DET-02"
+    },
+    {
+      "detected": true,
+      "detector": "DET-03"
+    },
+    {
+      "detected": true,
+      "detector": "DET-04"
+    },
+    {
+      "detected": true,
+      "detector": "DET-05"
+    },
+    {
+      "detected": true,
+      "detector": "DET-06"
+    },
+    {
+      "detected": true,
+      "detector": "DET-07"
+    },
+    {
+      "detected": true,
+      "detector": "DET-08"
+    },
+    {
+      "detected": true,
+      "detector": "DET-09"
+    },
+    {
+      "detected": true,
+      "detector": "DET-10"
+    },
+    {
+      "detected": true,
+      "detector": "DET-11"
+    },
+    {
+      "detected": true,
+      "detector": "DET-12"
+    },
+    {
+      "detected": true,
+      "detector": "DET-13"
+    },
+    {
+      "detected": true,
+      "detector": "DET-14"
+    },
+    {
+      "detected": true,
+      "detector": "DET-15"
+    },
+    {
+      "detected": true,
+      "detector": "DET-16"
+    },
+    {
+      "detected": true,
+      "detector": "DET-17"
+    },
+    {
+      "detected": true,
+      "detector": "DET-20"
+    },
+    {
+      "detected": true,
+      "detector": "DET-21"
+    },
+    {
+      "detected": true,
+      "detector": "DET-23"
+    },
+    {
+      "detected": true,
+      "detector": "DET-26"
+    }
+  ],
+  "disposition_blocked": 19,
+  "disposition_expected_blocks": 19,
+  "total": 21,
+  "version": "0.3.10"
+}

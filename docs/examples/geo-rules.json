@@ -1,0 +1,188 @@
+{
+  "exported_at": "2026-11-21T00:24:37.203633788Z",
+  "format": "rustips-rules",
+  "rules": [
+    {
+      "action": {
+        "type": "alert"
+      },
+      "description": "Sample only. Alert on any detection whose source country is CN. Disabled by default.",
+      "dry_run": false,
+      "enabled": false,
+      "id": 0,
+      "name": "Geo alert: China",
+      "priority": 300,
+      "severity": "warning",
+      "when": {
+        "asns": [],
+        "countries": [
+          "CN"
+        ],
+        "days": [],
+        "detectors": [],
+        "end": null,
+        "last_seen_within": null,
+        "min_count": null,
+        "min_strikes": null,
+        "not_asns": [],
+        "not_countries": [],
+        "not_sources": [],
+        "only_if_blocked": false,
+        "ports": [],
+        "protocols": [],
+        "sources": [],
+        "start": null,
+        "tags": []
+      }
+    },
+    {
+      "action": {
+        "duration": "24h",
+        "type": "block_temp"
+      },
+      "description": "Sample only. Block a detected source for 24h when its country is CN, RU, KP or IR. Disabled by default.",
+      "dry_run": false,
+      "enabled": false,
+      "id": 0,
+      "name": "Geo block 24h: high-risk list",
+      "priority": 280,
+      "severity": "critical",
+      "when": {
+        "asns": [],
+        "countries": [
+          "CN",
+          "RU",
+          "KP",
+          "IR"
+        ],
+        "days": [],
+        "detectors": [],
+        "end": null,
+        "last_seen_within": null,
+        "min_count": null,
+        "min_strikes": null,
+        "not_asns": [],
+        "not_countries": [],
+        "not_sources": [],
+        "only_if_blocked": false,
+        "ports": [],
+        "protocols": [],
+        "sources": [],
+        "start": null,
+        "tags": []
+      }
+    },
+    {
+      "action": {
+        "type": "allow"
+      },
+      "description": "Sample only. Allow Cloudflare/Google example ASNs after a detection. Disabled by default.",
+      "dry_run": false,
+      "enabled": false,
+      "id": 0,
+      "name": "Geo allow: partner ASNs",
+      "priority": 400,
+      "severity": "info",
+      "when": {
+        "asns": [
+          13335,
+          15169
+        ],
+        "countries": [],
+        "days": [],
+        "detectors": [],
+        "end": null,
+        "last_seen_within": null,
+        "min_count": null,
+        "min_strikes": null,
+        "not_asns": [],
+        "not_countries": [],
+        "not_sources": [],
+        "only_if_blocked": false,
+        "ports": [],
+        "protocols": [],
+        "sources": [],
+        "start": null,
+        "tags": []
+      }
+    },
+    {
+      "action": {
+        "ladder": [
+          "24h",
+          "48h",
+          "permanent"
+        ],
+        "type": "escalate"
+      },
+      "description": "Sample only. Use a 24h -> 48h -> permanent ladder for example hosting ASNs. Disabled by default.",
+      "dry_run": false,
+      "enabled": false,
+      "id": 0,
+      "name": "Geo escalate: hosting ASNs",
+      "priority": 260,
+      "severity": "warning",
+      "when": {
+        "asns": [
+          16509,
+          14618,
+          8075
+        ],
+        "countries": [],
+        "days": [],
+        "detectors": [],
+        "end": null,
+        "last_seen_within": null,
+        "min_count": null,
+        "min_strikes": null,
+        "not_asns": [],
+        "not_countries": [],
+        "not_sources": [],
+        "only_if_blocked": false,
+        "ports": [],
+        "protocols": [],
+        "sources": [],
+        "start": null,
+        "tags": []
+      }
+    },
+    {
+      "action": {
+        "type": "alert"
+      },
+      "description": "Sample only. Alert when a detection comes from outside US/GB/DE/CA/AU. Disabled by default.",
+      "dry_run": false,
+      "enabled": false,
+      "id": 0,
+      "name": "Geo alert: outside expected countries",
+      "priority": 200,
+      "severity": "info",
+      "when": {
+        "asns": [],
+        "countries": [],
+        "days": [],
+        "detectors": [],
+        "end": null,
+        "last_seen_within": null,
+        "min_count": null,
+        "min_strikes": null,
+        "not_asns": [],
+        "not_countries": [
+          "US",
+          "GB",
+          "DE",
+          "CA",
+          "AU"
+        ],
+        "not_sources": [],
+        "only_if_blocked": false,
+        "ports": [],
+        "protocols": [],
+        "sources": [],
+        "start": null,
+        "tags": []
+      }
+    }
+  ],
+  "version": 1
+}

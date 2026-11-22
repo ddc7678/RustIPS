@@ -1,0 +1,7 @@
+/target/
+/dist/
+/repos/
+/draft_requirements.md
+*.db
+*.db-wal
+*.db-shm

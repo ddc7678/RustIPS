@@ -1,0 +1,8 @@
+{"ts":"2026-11-21T04:17:25Z","rss_bytes":45281280,"cpu_ns":10996646000,"restarts":0,"db_bytes":3911680,"packets":1087,"drops":0,"detections":65,"log_events":6872,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:17:41Z","rss_bytes":45289472,"cpu_ns":11171852000,"restarts":0,"db_bytes":3911680,"packets":1104,"drops":0,"detections":65,"log_events":6880,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:17:56Z","rss_bytes":45289472,"cpu_ns":11332893000,"restarts":0,"db_bytes":3911680,"packets":1119,"drops":0,"detections":65,"log_events":6886,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:18:12Z","rss_bytes":45297664,"cpu_ns":11500789000,"restarts":0,"db_bytes":3911680,"packets":1136,"drops":0,"detections":65,"log_events":6892,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:18:28Z","rss_bytes":45559808,"cpu_ns":11661849000,"restarts":0,"db_bytes":3911680,"packets":1155,"drops":0,"detections":65,"log_events":6897,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:18:43Z","rss_bytes":45563904,"cpu_ns":11823266000,"restarts":0,"db_bytes":3911680,"packets":1172,"drops":0,"detections":65,"log_events":6902,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:18:59Z","rss_bytes":45314048,"cpu_ns":11986817000,"restarts":0,"db_bytes":3911680,"packets":1187,"drops":0,"detections":65,"log_events":6910,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
+{"ts":"2026-11-21T04:19:15Z","rss_bytes":45576192,"cpu_ns":12148403000,"restarts":0,"db_bytes":3911680,"packets":1204,"drops":0,"detections":65,"log_events":6914,"alerts_pending":0,"alerts_failed":0,"journal":"running"}
