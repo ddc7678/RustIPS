@@ -751,9 +751,10 @@ install-in-minutes check.
   gate, `0.3.5` distribution + first run, `0.3.6` release candidate, `0.3.7`
   detector catalog/sidebar, `0.3.8` detector scope/parameters, `0.3.9`
   navigation/theme/honeypot, `0.3.10` menu/state/internal-detector cleanup,
-  `0.3.11` IP history, `0.3.12` Active-blocks HTML fix, `0.3.13` resource graphs
-  and `0.3.14` rules-table layout fix. Do not open a `0.4.x` line unless the
-  owner explicitly decides to; new work is the next `0.3.PATCH`.
+  `0.3.11` IP history, `0.3.12` Active-blocks HTML fix, `0.3.13` resource graphs,
+  `0.3.14` rules-table layout fix and `0.3.15` country badges. Do not open a
+  `0.4.x` line unless the owner explicitly decides to; new work is the next
+  `0.3.PATCH`.
 - No `1.0.0` until the system has run in production for a defined soak period and every
   `0.3.x` MUST requirement is validated.
 - `1.0.0` entry criteria (proposed): 30 days continuous production operation with no
@@ -782,6 +783,7 @@ install-in-minutes check.
 | 0.3.12 | Active-blocks fix | Separate clickable source markup from the Unblock confirmation attribute and hidden form value. |
 | 0.3.13 | Resource graphs | Dashboard CPU/memory/database-storage sparklines, 30-second sampling, 24-hour dialog and schema v10 `system_samples`. |
 | 0.3.14 | Rules layout fix | Give the Disposition rules Name and Match columns explicit width/minimums with wrapping and horizontal scroll fallback. |
+| 0.3.15 | Country badges | Show GeoIP country tags beside source addresses everywhere, with default detector-tag styling and Settings-managed custom background/text colors per country. |
 | 1.0.0 | Stable | After soak criteria in §14.1. |
 | Post-1.0 | Snort fork (separate repository) | Decision recorded at the 0.3.4 gate; the fork itself starts only after 1.0 is stable, and only if the gate was missed. See §19; not part of this document's deliverables. |
 

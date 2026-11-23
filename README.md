@@ -7,25 +7,27 @@ automated attacks, and blocks the source address at the firewall.
 **Project website:** <https://rustips.tech/> — product overview, screenshots and
 the design story.
 
-This repository currently contains **0.3.14**: the packet sensor, web UI,
+This repository currently contains **0.3.15**: the packet sensor, web UI,
 journald ingestion, rules platform, HTTP detectors, GeoIP/ASN enrichment,
 webhook alerting, slow-scan detection, the full-detector coverage gate, the
 distribution/first-run experience, a detector catalog with per-detector
 enable/disable, editable parameters with reset-to-default, collapsible
 grouped left-sidebar navigation, flash-free theme loading, an optional packet
 honeypot (DET-26), a per-source IP history dialog with country/ASN and a
-permanent-block action, and dashboard CPU/memory/database-storage graphs with a
-24-hour history dialog. The single binary installs itself
-with `setup --install-service`, captures traffic, runs detectors DET-01…17/20…26,
-parses HTTP access logs that reach the journal, stores evidence in SQLite,
-applies the configured rules and strike ladder, enforces blocks with nftables,
-and serves an embedded web UI on loopback with PAM authentication. Detector
+permanent-block action, dashboard CPU/memory/database-storage graphs with a
+24-hour history dialog, and GeoIP country badges beside source addresses with
+an editable default color and comma-separated per-country overrides. The single
+binary installs itself with `setup --install-service`, captures traffic, runs
+detectors DET-01…17/20…26, parses HTTP access logs that reach the journal,
+stores evidence in SQLite, applies the configured rules and strike ladder,
+enforces blocks with nftables, and serves an embedded web UI on loopback with
+PAM authentication. Detector
 logic is compiled Rust; custom detection signatures are not scriptable.
 File-only log sources and the optional eBPF/XDP capture path remain later work.
 
 ## Status
 
-| Area | 0.3.14 |
+| Area | 0.3.15 |
 |---|---|
 | Live capture (AF_PACKET) and pcap replay | yes |
 | Detectors | packet: DET-01…15, slow-scan DET-20 and honeypot DET-26 (block after 3); log: DET-16/17/21/23 |
@@ -47,6 +49,7 @@ File-only log sources and the optional eBPF/XDP capture path remain later work.
 | Detection parameters | every threshold and path/login list is editable in the UI; overrides are validated/stored in SQLite, reset per field/group/all, and apply at daemon start |
 | Honeypot | optional DET-26 watches configured unused TCP/UDP ports; disabled by default, fires after 3 contacts and blocks through the shipped disposition rule |
 | IP history | every source address is clickable and opens a dialog with country (ISO), ASN, detections, blocks, strikes and related log events, plus a permanent-block button |
+| Country badges | when the GeoIP country index is loaded, source addresses show an ISO country tag; default is black with white text, with editable default and per-country colors in Settings |
 | Resource graphs | dashboard sparklines for process CPU %, RSS memory (MB) and database storage (MB); click for a 24-hour dialog |
 | File-only logs / eBPF-XDP | not yet; DET-23 works for access logs that reach the journal |
 
@@ -58,8 +61,9 @@ rules, 0.3.2 GeoIP + HTTP detectors, 0.3.3 hardening/alerting, 0.3.4
 coverage gate, 0.3.5 distribution/first run, 0.3.6 release candidate, 0.3.7
 detector catalog/sidebar, 0.3.8 parameter editing, 0.3.9 navigation/theme/
 honeypot, 0.3.10 menu/state cleanup, 0.3.11 IP history, the 0.3.12
-Active-blocks fix, 0.3.13 resource graphs and the 0.3.14 disposition-rule
-layout fix are done. The next step is the 1.0 soak/entry criteria. See `requirements.md` §14 for the full table.
+Active-blocks fix, 0.3.13 resource graphs, the 0.3.14 disposition-rule layout fix
+and 0.3.15 country badges are done. The next step is the 1.0 soak/entry
+criteria. See `requirements.md` §14 for the full table.
 
 ## Requirements
 
@@ -83,7 +87,7 @@ cargo test
 ```
 
 The release profile is thin-LTO, one codegen unit, stripped. The resulting
-binary is about 6 MB. The full suite is 160 tests (146 library, 6 CLI
+binary is about 6 MB. The full suite is 162 tests (148 library, 6 CLI
 first-run/recovery, 1 replay, 1 end-to-end web, 2 webhook delivery, 3 robustness,
 1 coverage scorecard).
 
@@ -215,7 +219,7 @@ existing config, and roll back automatically if verification fails. See
 | Page | What it shows |
 |---|---|
 | Dashboard | packets, throughput, detections/blocks per minute, active blocks, capture drops, uptime, recent detections, top sources and ports, CPU/memory/database sparklines |
-| Detections | detector filter, pagination, evidence, one-click 1-hour block, clickable source IP history |
+| Detections | detector filter, pagination, evidence, one-click 1-hour block, clickable source IP history and country badges |
 | Detectors | every detector with category, description, live thresholds/paths, editable parameters with per-field/group/all reset, default disposition and a green/red single-button state toggle |
 | Logs | journal/file origin filter, free-text search, parser, template, unit/identifier, priority, user, source IP, message, resulting detection, journal health and cursor-gap banner |
 | Active blocks | source, reason, detector, strike, remaining time, unblock; manual block form |
@@ -224,7 +228,7 @@ existing config, and roll back automatically if verification fails. See
 | Allowlist | add/remove labelled CIDRs; implicit entries are read-only |
 | Disposition rules | list, create, edit and delete rules; green/red single-button enable/disable; country/ASN conditions; validation errors; revision history; import/export; dry-run against recent detections; GeoIP/ASN index status and manual check; sample geo rules |
 | Alerts | add/edit/remove webhook targets; per-target URL, events, severity, timeout, retries, dedupe and queue cap; queue rows with payloads, retry/send-now/delete, clear finished, send a test alert |
-| Settings | bind/port, overrides, PAM service/group, users with access, timeouts, detection and ladder summary, honeypot enable/ports, webhook status, tunnel command |
+| Settings | bind/port, overrides, PAM service/group, users with access, timeouts, detection and ladder summary, honeypot enable/ports, country badge colors, webhook status, tunnel command |
 | Audit | every login, block, unblock, allowlist and settings change with actor |
 
 The dashboard polls every 2 seconds; the detections and blocks tables refresh a
@@ -551,6 +555,7 @@ tests in `src/logs/`; `docs/logs.md` shows how to exercise the real journal.
   custom-detection answer.
 * `docs/security-review.md` — 0.3.6 threat model, findings and accepted risks.
 * `docs/soak/0.3.6.md` — short-soak method and results.
+* `docs/iterations/0.3.15.md` — GeoIP country badges and custom colors.
 * `docs/iterations/0.3.14.md` — disposition-rule table column sizing.
 * `docs/iterations/0.3.13.md` — dashboard resource graphs and 24-hour history.
 * `docs/iterations/0.3.12.md` — Active-blocks confirm-attribute fix.
@@ -561,7 +566,8 @@ tests in `src/logs/`; `docs/logs.md` shows how to exercise the real journal.
 * `docs/iterations/0.3.7.md` — detector catalog, toggles and sidebar.
 * `docs/iterations/0.3.6.md` — release-candidate validation and 1.0 decision.
 * `docs/iterations/0.3.5.md` — distribution, first-run tests and `diagnose`.
-* `docs/coverage/0.3.14.md` — the current TEST-37 scorecard.
+* `docs/coverage/0.3.15.md` — the current TEST-37 scorecard.
+* `docs/coverage/0.3.14.md` — the rules-layout scorecard.
 * `docs/coverage/0.3.13.md` — the resource-graph scorecard.
 * `docs/coverage/0.3.12.md` — the Active-blocks fix scorecard.
 * `docs/coverage/0.3.11.md` — the IP-history scorecard.

@@ -3,7 +3,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rustips::auth;
@@ -11,10 +12,30 @@ use rustips::config::{Config, DEFAULT_CONFIG_TOML};
 use rustips::daemon::Stats;
 use rustips::db::Db;
 use rustips::enforce::DryRunEnforcer;
+use rustips::geo::{GeoData, GeoHandle, GeoIndex, GeoKind, build_index};
 use rustips::logs::{LogEvent, Origin};
 use rustips::model::{Detection, Detector, Proto};
 use rustips::paths::Layout;
 use rustips::web::{self, WebOptions};
+
+fn test_geo(dir: &Path) -> GeoHandle {
+    let v4 = dir.join("web-test-geo-v4.csv");
+    let v6 = dir.join("web-test-geo-v6.csv");
+    let index = dir.join("web-test-country.bin");
+    let mut file = std::fs::File::create(&v4).unwrap();
+    writeln!(file, "1.0.1.0,1.0.3.255,CN").unwrap();
+    writeln!(file, "203.0.113.0,203.0.113.255,US").unwrap();
+    drop(file);
+    let mut file = std::fs::File::create(&v6).unwrap();
+    writeln!(file, "2001:db8::,2001:db8:ffff:ffff:ffff:ffff:ffff:ffff,GB").unwrap();
+    drop(file);
+    build_index(GeoKind::Country, &v4, &v6, &index).unwrap();
+    let index = GeoIndex::open(&index, GeoKind::Country).unwrap();
+    Arc::new(RwLock::new(GeoData {
+        country: Some(Arc::new(index)),
+        asn: None,
+    }))
+}
 
 struct Response {
     status: u16,
@@ -183,7 +204,7 @@ fn ui_login_breakglass_and_manual_block() {
         &layout,
         Arc::new(Stats::new()),
         Arc::new(DryRunEnforcer),
-        rustips::geo::empty_handle(),
+        test_geo(&dir),
         WebOptions {
             bind: Some("127.0.0.1".into()),
             port: Some(port),
@@ -276,6 +297,7 @@ fn ui_login_breakglass_and_manual_block() {
     assert!(dashboard.body.contains("/assets/theme.js"));
     assert!(dashboard.body.contains("id=\"ip-dialog\""));
     assert!(dashboard.body.contains("data-ip=\"203.0.113.7\""));
+    assert!(dashboard.body.contains("country-US"));
     assert!(dashboard.body.contains("RustIPS resources"));
     assert!(dashboard.body.contains("id=\"system-graphs\""));
     assert!(dashboard.body.contains("12.5%"));
@@ -293,7 +315,8 @@ fn ui_login_breakglass_and_manual_block() {
     assert!(ip_history.body.contains("sshd.invalid_user"));
     assert!(ip_history.body.contains("Permanently block"));
     assert!(ip_history.body.contains("name=\"minutes\" value=\"0\""));
-    assert!(ip_history.body.contains("GeoIP index not loaded"));
+    assert!(ip_history.body.contains("Country (ISO)"));
+    assert!(ip_history.body.contains("country-US"));
     let unauth_history = get(port, "/api/ip?ip=203.0.113.7", None);
     assert_eq!(unauth_history.status, 303);
     assert!(unauth_history.headers.contains("Location: /login"));
@@ -589,6 +612,99 @@ fn ui_login_breakglass_and_manual_block() {
             .is_empty()
     );
 
+    // Country badge colors: the default tag is the blue .tag style; the
+    // generated stylesheet carries custom entries.
+    let colors_css = get(port, "/assets/country-colors.css", None);
+    assert_eq!(colors_css.status, 200);
+    assert!(
+        colors_css
+            .body
+            .contains(".country-tag { background: #000000; color: #ffffff; }")
+    );
+    assert!(!colors_css.body.contains(".country-US"));
+    let color_saved = post(
+        port,
+        "/settings/geo-colors",
+        &format!("code=US&background=%23b91c1c&foreground=%23ffffff&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(color_saved.status, 303, "{}", color_saved.headers);
+    assert!(color_saved.headers.contains("Location: /settings"));
+    let colors_css = get(port, "/assets/country-colors.css", None);
+    assert!(
+        colors_css
+            .body
+            .contains(".country-US { background: #b91c1c; color: #ffffff; }")
+    );
+    let default_saved = post(
+        port,
+        "/settings/geo-colors/default",
+        &format!("background=%23101010&foreground=%23eeeeee&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(default_saved.status, 303);
+    let colors_css = get(port, "/assets/country-colors.css", None);
+    assert!(
+        colors_css
+            .body
+            .contains(".country-tag { background: #101010; color: #eeeeee; }")
+    );
+    let color_list = post(
+        port,
+        "/settings/geo-colors",
+        &format!("code=CN,%20RU&background=%23b91c1c&foreground=%23ffffff&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(color_list.status, 303);
+    let colors_css = get(port, "/assets/country-colors.css", None);
+    assert!(
+        colors_css
+            .body
+            .contains(".country-CN { background: #b91c1c; color: #ffffff; }")
+    );
+    assert!(
+        colors_css
+            .body
+            .contains(".country-RU { background: #b91c1c; color: #ffffff; }")
+    );
+    let settings = get(port, "/settings", Some(&cookie));
+    assert!(settings.body.contains("Country badge colors"));
+    assert!(settings.body.contains("country-US"));
+    assert!(settings.body.contains("country-CN"));
+    assert!(
+        settings
+            .body
+            .contains("href=\"/settings?edit=CN#country-colors\"")
+    );
+    assert!(settings.body.contains("#b91c1c"));
+    let edit = get(port, "/settings?edit=CN", Some(&cookie));
+    assert!(edit.body.contains("Update country colors"));
+    assert!(
+        edit.body
+            .contains("name=\"code\" maxlength=\"64\" value=\"CN\"")
+    );
+    let color_invalid = post(
+        port,
+        "/settings/geo-colors",
+        &format!("code=USA&background=red&foreground=%23fff&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(color_invalid.status, 303);
+    assert!(
+        color_invalid
+            .headers
+            .contains("Location: /settings?notice=country_color_invalid")
+    );
+    let color_removed = post(
+        port,
+        "/settings/geo-colors/delete",
+        &format!("code=US&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(color_removed.status, 303);
+    let colors_css = get(port, "/assets/country-colors.css", None);
+    assert!(!colors_css.body.contains(".country-US"));
+
     // A stored value cannot inject markup into the page.
     let detected = get(port, "/detections", Some(&cookie));
     assert_eq!(detected.status, 200);
@@ -786,6 +902,7 @@ fn ui_login_breakglass_and_manual_block() {
     assert!(summary.body.contains("\"log_events_run\""));
     assert!(summary.body.contains("\"log_dropped\""));
     assert!(summary.body.contains("\"alerts_pending\""));
+    assert!(summary.body.contains("\"country\":\"US\""));
 
     // -------- CSRF on a state-changing request
     let no_csrf = post(

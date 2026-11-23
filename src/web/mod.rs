@@ -28,6 +28,7 @@ use chrono::Utc;
 
 use crate::auth::{self, AuthOutcome, LoginLimiter};
 use crate::config::{BlockDuration, Config, Mode, UnblockEffect};
+use crate::countries;
 use crate::daemon::Stats;
 use crate::db::Db;
 use crate::enforce::Enforcer;
@@ -782,6 +783,7 @@ fn route(ctx: &Ctx, request: &Request) -> Response {
             }
         }
         ("GET", "/assets/app.css") => Response::text(200, "text/css; charset=utf-8", CSS),
+        ("GET", "/assets/country-colors.css") => country_colors_css(ctx),
         ("GET", "/assets/app.js") => {
             Response::text(200, "application/javascript; charset=utf-8", JS)
         }
@@ -924,9 +926,16 @@ fn authenticated(ctx: &Ctx, request: &Request) -> Response {
         ("POST", "/alerts/settings") => do_alert_settings(ctx, &view, request),
         ("POST", "/settings/web") => do_settings(ctx, &view, request),
         ("POST", "/settings/reset") => do_settings_reset(ctx, &view),
+        ("POST", "/settings/geo-colors") => do_country_color_save(ctx, &view, request),
+        ("POST", "/settings/geo-colors/default") => do_country_default_save(ctx, &view, request),
+        ("POST", "/settings/geo-colors/delete") => do_country_color_delete(ctx, &view, request),
         ("GET", _) | ("POST", _) => Response::error(404, "Not found", "No such page."),
         _ => Response::error(405, "Method not allowed", "GET and POST only."),
     }
+}
+
+fn geo_data(ctx: &Ctx) -> std::sync::RwLockReadGuard<'_, crate::geo::GeoData> {
+    ctx.geo.read().unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn page<'a>(ctx: &'a Ctx, view: &'a SessionView) -> pages::Page<'a> {
@@ -1160,7 +1169,8 @@ fn page_dashboard(ctx: &Ctx, view: &SessionView) -> Response {
         top_ports: &top_ports,
         system_hour: &system_hour,
     };
-    let body = pages::dashboard(&page(ctx, view), &dash);
+    let geo = geo_data(ctx);
+    let body = pages::dashboard(&page(ctx, view), &dash, &geo);
     Response::html(body)
 }
 
@@ -1199,6 +1209,7 @@ fn api_summary(ctx: &Ctx) -> Response {
         .map(|targets| targets.len())
         .unwrap_or(0);
 
+    let geo = geo_data(ctx);
     let recent: Vec<serde_json::Value> = recent
         .iter()
         .map(|det| {
@@ -1206,6 +1217,7 @@ fn api_summary(ctx: &Ctx) -> Response {
                 "detector": det.detector.as_str(),
                 "detector_title": det.detector.title(),
                 "src": det.src.to_string(),
+                "country": geo.lookup(det.src).country,
                 "dst": det.dst.map(|d| d.to_string()),
                 "dst_port": det.dst_port,
                 "proto": det.proto.as_str(),
@@ -1214,6 +1226,16 @@ fn api_summary(ctx: &Ctx) -> Response {
                 "first_seen": det.first_seen,
                 "last_seen": det.last_seen,
             })
+        })
+        .collect();
+    let sources: Vec<serde_json::Value> = sources
+        .into_iter()
+        .map(|(src, count)| {
+            let country = src
+                .parse::<IpAddr>()
+                .ok()
+                .and_then(|ip| geo.lookup(ip).country);
+            serde_json::json!([src, count, country])
         })
         .collect();
 
@@ -1245,6 +1267,18 @@ fn api_summary(ctx: &Ctx) -> Response {
         "top_sources": sources,
         "top_ports": ports,
     }))
+}
+
+fn country_colors_css(ctx: &Ctx) -> Response {
+    let (colors, default) = Db::open(&ctx.db_path)
+        .ok()
+        .map(|db| (countries::load(&db), countries::load_default(&db)))
+        .unwrap_or_else(|| (countries::CountryColors::new(), countries::default_color()));
+    Response::text(
+        200,
+        "text/css; charset=utf-8",
+        &countries::css(&colors, &default),
+    )
 }
 
 fn api_system(ctx: &Ctx, request: &Request) -> Response {
@@ -1487,6 +1521,7 @@ fn page_detections(ctx: &Ctx, view: &SessionView, request: &Request) -> Response
     let rows = db
         .detections_page(PAGE_SIZE, offset, detector.as_deref())
         .unwrap_or_default();
+    let geo = geo_data(ctx);
     let body = pages::detections(
         &page(ctx, view),
         &rows,
@@ -1494,6 +1529,7 @@ fn page_detections(ctx: &Ctx, view: &SessionView, request: &Request) -> Response
         pages,
         total,
         detector.as_deref().unwrap_or(""),
+        &geo,
     );
     Response::html(with_partial(body, detector.as_deref(), page_no))
 }
@@ -1526,7 +1562,8 @@ fn partial_detections(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
     let rows = db
         .detections_page(PAGE_SIZE, offset, detector.as_deref())
         .unwrap_or_default();
-    Response::html(pages::detection_rows(&page(ctx, view), &rows))
+    let geo = geo_data(ctx);
+    Response::html(pages::detection_rows(&page(ctx, view), &rows, &geo))
 }
 
 // ------------------------------------------------------------------ detectors
@@ -1784,6 +1821,7 @@ fn page_logs(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         parse_errors: ctx.stats.log_parse_errors.load(Ordering::Relaxed),
         pruned,
     };
+    let geo = geo_data(ctx);
     Response::html(pages::logs(
         &page(ctx, view),
         &rows,
@@ -1793,6 +1831,7 @@ fn page_logs(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         origin.unwrap_or(""),
         search.as_deref().unwrap_or(""),
         &status,
+        &geo,
     ))
 }
 
@@ -2142,7 +2181,8 @@ fn page_rule_check(ctx: &Ctx, view: &SessionView) -> Response {
     let set = match RuleSet::compile(stored, &ctx.cfg.ladder.steps) {
         Ok(set) => set,
         Err(errors) => {
-            return Response::html(pages::rule_check(&page(ctx, view), &[], &errors));
+            let geo = geo_data(ctx);
+            return Response::html(pages::rule_check(&page(ctx, view), &[], &errors, &geo));
         }
     };
     let rows = db.recent_detections(100).unwrap_or_default();
@@ -2164,7 +2204,8 @@ fn page_rule_check(ctx: &Ctx, view: &SessionView) -> Response {
         let decision = set.evaluate(&detection, &history, &geo_info);
         evaluated.push((detection, decision));
     }
-    Response::html(pages::rule_check(&page(ctx, view), &evaluated, &[]))
+    let geo = geo_data(ctx);
+    Response::html(pages::rule_check(&page(ctx, view), &evaluated, &[], &geo))
 }
 
 fn rules_export(ctx: &Ctx) -> Response {
@@ -2201,6 +2242,7 @@ fn page_alerts(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         .param("notice")
         .and_then(notice_text)
         .map(str::to_string);
+    let geo = geo_data(ctx);
     Response::html(pages::alerts(
         &page(ctx, view),
         &targets,
@@ -2208,6 +2250,7 @@ fn page_alerts(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         &stats,
         &rows,
         notice.as_deref(),
+        &geo,
     ))
 }
 
@@ -2530,7 +2573,8 @@ fn page_blocks(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         .param("notice")
         .and_then(notice_text)
         .map(str::to_string);
-    let body = pages::blocks(&page(ctx, view), &rows, notice.as_deref());
+    let geo = geo_data(ctx);
+    let body = pages::blocks(&page(ctx, view), &rows, notice.as_deref(), &geo);
     let body = body.replacen(
         "<body data-live=\"1\">",
         "<body data-live=\"1\" data-partial=\"/partial/blocks\">",
@@ -2545,7 +2589,8 @@ fn partial_blocks(ctx: &Ctx, view: &SessionView) -> Response {
         Err(response) => return response,
     };
     let rows = db.list_active_blocks().unwrap_or_default();
-    Response::html(pages::block_rows(&page(ctx, view), &rows, Utc::now()))
+    let geo = geo_data(ctx);
+    Response::html(pages::block_rows(&page(ctx, view), &rows, Utc::now(), &geo))
 }
 
 fn page_history(ctx: &Ctx, view: &SessionView) -> Response {
@@ -2554,7 +2599,8 @@ fn page_history(ctx: &Ctx, view: &SessionView) -> Response {
         Err(response) => return response,
     };
     let rows = db.list_block_history(500).unwrap_or_default();
-    Response::html(pages::history(&page(ctx, view), &rows))
+    let geo = geo_data(ctx);
+    Response::html(pages::history(&page(ctx, view), &rows, &geo))
 }
 
 fn page_strikes(ctx: &Ctx, view: &SessionView) -> Response {
@@ -2563,7 +2609,8 @@ fn page_strikes(ctx: &Ctx, view: &SessionView) -> Response {
         Err(response) => return response,
     };
     let rows = db.list_strikes().unwrap_or_default();
-    Response::html(pages::strikes(&page(ctx, view), &rows, &ctx.cfg))
+    let geo = geo_data(ctx);
+    Response::html(pages::strikes(&page(ctx, view), &rows, &ctx.cfg, &geo))
 }
 
 // ------------------------------------------------------------------- allowlist
@@ -2652,6 +2699,20 @@ fn page_settings(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
     };
     let overrides = db.list_settings().unwrap_or_default();
     let detection_overrides = db.detection_overrides().unwrap_or_default();
+    let country_colors = countries::load(&db);
+    let country_default = countries::load_default(&db);
+    let country_loaded = geo_data(ctx).country.is_some();
+    let edit_code = request
+        .param("edit")
+        .and_then(countries::normalize_code)
+        .unwrap_or_default();
+    let edit_color = country_colors.get(&edit_code);
+    let edit_background = edit_color
+        .map(|color| color.background.clone())
+        .unwrap_or_else(|| country_default.background.clone());
+    let edit_foreground = edit_color
+        .map(|color| color.foreground.clone())
+        .unwrap_or_else(|| country_default.foreground.clone());
     let users = auth::users_in_group(&ctx.cfg.web.admin_group);
     let notice = request
         .param("notice")
@@ -2681,6 +2742,12 @@ fn page_settings(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         &ctx.cfg,
         &overrides,
         &detection_overrides,
+        &country_colors,
+        &country_default,
+        country_loaded,
+        &edit_code,
+        &edit_background,
+        &edit_foreground,
         &users,
         &bind_value,
         port_value,
@@ -2770,6 +2837,108 @@ fn do_settings_reset(ctx: &Ctx, view: &SessionView) -> Response {
         "web bind/port override removed",
     );
     Response::redirect("/settings?notice=reset")
+}
+
+fn do_country_color_save(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(codes) = request.param("code").and_then(countries::normalize_codes) else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let Some(background) = request
+        .param("background")
+        .and_then(countries::normalize_color)
+    else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let Some(foreground) = request
+        .param("foreground")
+        .and_then(countries::normalize_color)
+    else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut colors = countries::load(&db);
+    for code in &codes {
+        colors.insert(
+            code.clone(),
+            countries::CountryColor {
+                background: background.clone(),
+                foreground: foreground.clone(),
+            },
+        );
+    }
+    if let Err(e) = countries::save(&db, &colors) {
+        return Response::error(500, "Color unchanged", &e.to_string());
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "settings.geo_colors",
+        &codes.join(","),
+        &format!("background={background} foreground={foreground}"),
+    );
+    Response::redirect("/settings?notice=country_color_saved")
+}
+
+fn do_country_default_save(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(background) = request
+        .param("background")
+        .and_then(countries::normalize_color)
+    else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let Some(foreground) = request
+        .param("foreground")
+        .and_then(countries::normalize_color)
+    else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    if let Err(e) = countries::save_default(
+        &db,
+        &countries::CountryColor {
+            background: background.clone(),
+            foreground: foreground.clone(),
+        },
+    ) {
+        return Response::error(500, "Color unchanged", &e.to_string());
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "settings.geo_default",
+        "default",
+        &format!("background={background} foreground={foreground}"),
+    );
+    Response::redirect("/settings?notice=country_default_saved")
+}
+
+fn do_country_color_delete(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(code) = request.param("code").and_then(countries::normalize_code) else {
+        return Response::redirect("/settings?notice=country_color_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut colors = countries::load(&db);
+    colors.remove(&code);
+    if let Err(e) = countries::save(&db, &colors) {
+        return Response::error(500, "Color unchanged", &e.to_string());
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "settings.geo_colors.remove",
+        &code,
+        "custom country color removed",
+    );
+    Response::redirect("/settings?notice=country_color_removed")
 }
 
 // --------------------------------------------------------------- block actions
@@ -2950,6 +3119,10 @@ fn notice_text(code: &str) -> Option<&'static str> {
         "reset" => {
             Some("Binding override removed. The configuration file applies after a restart.")
         }
+        "country_color_saved" => Some("Country badge color saved."),
+        "country_default_saved" => Some("Default country badge color saved."),
+        "country_color_removed" => Some("Country badge color removed."),
+        "country_color_invalid" => Some("Use a two-letter country code and #rrggbb colors."),
         "bind_failed" => Some("That address and port cannot be bound; nothing was saved."),
         "need_confirm" => Some("Confirm the non-loopback warning before saving."),
         "rule_saved" => Some("Rule saved. The daemon reloads it within a second."),

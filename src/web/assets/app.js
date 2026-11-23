@@ -95,7 +95,22 @@
     return td;
   }
 
-  function ipCell(ip) {
+  function countryBadge(country) {
+    if (!country) return null;
+    var badge = document.createElement("span");
+    badge.className = "tag country-tag country-" + country;
+    badge.textContent = country;
+    return badge;
+  }
+
+  function appendCountry(parent, country) {
+    var badge = countryBadge(country);
+    if (!badge) return;
+    parent.appendChild(document.createTextNode(" "));
+    parent.appendChild(badge);
+  }
+
+  function ipCell(ip, country) {
     var td = document.createElement("td");
     td.className = "mono";
     if (ip && ip !== "0.0.0.0") {
@@ -105,6 +120,7 @@
       button.dataset.ip = ip;
       button.textContent = ip;
       td.appendChild(button);
+      appendCountry(td, country);
     } else {
       td.textContent = ip || "—";
     }
@@ -125,7 +141,7 @@
       detector.appendChild(tag);
       detector.appendChild(document.createTextNode(" " + (r.detector_title || "")));
       tr.appendChild(detector);
-      tr.appendChild(ipCell(r.src));
+      tr.appendChild(ipCell(r.src, r.country));
       tr.appendChild(cell(tr, r.dst ? r.dst + (r.dst_port ? ":" + r.dst_port : "") : "—", "mono"));
       tr.appendChild(cell(tr, r.count));
       body.appendChild(tr);
@@ -147,6 +163,7 @@
         button.dataset.ip = r[0];
         button.textContent = r[0];
         left.appendChild(button);
+        appendCountry(left, r[2]);
       } else {
         left.textContent = r[0];
       }

@@ -176,6 +176,24 @@ override is invalid, `rustips check` and daemon start fail with a
 `stored detection overrides: …` message; reset it in the UI or remove the
 `detection.overrides` setting from SQLite after taking a backup.
 
+### Country badges and colors
+
+When `country.bin` is loaded under `/var/lib/rustips/geo/`, source addresses in
+the UI show an ISO country tag. The default is black with white text.
+
+Customize badges in **Settings → Country badge colors**:
+
+- edit the default background/text pair, or enter one or more comma-separated
+  two-letter country codes with their own colors;
+- use Edit on an existing row to prefill the form, or Remove to return that
+  country to the default;
+- the default is stored in `settings.geo.country_default`; overrides are stored
+  in `settings.geo.country_colors` and applied immediately through
+  `/assets/country-colors.css`.
+
+If the country index is absent, the Settings panel warns and no badges are
+shown. Run `sudo rustips geo update` to load it.
+
 ### Honeypot
 
 Honeypot mode is disabled by default. Configure it in **Settings → Honeypot**:

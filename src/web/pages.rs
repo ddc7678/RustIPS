@@ -12,7 +12,9 @@ use std::net::{IpAddr, SocketAddr};
 use chrono::{DateTime, Utc};
 
 use crate::config::{BlockDuration, Config, Mode, UnblockEffect};
+use crate::countries::{CountryColor, CountryColors};
 use crate::db::SystemPoint;
+use crate::geo::GeoData;
 use crate::logs::LogEvent;
 use crate::model::{AllowlistEntry, Block, BlockState, Detection, Detector, Strike};
 use crate::params::{self, ParamKind};
@@ -86,6 +88,34 @@ pub fn ip_link(ip: IpAddr) -> String {
 pub fn ip_text_or_link(value: &str) -> String {
     match value.parse::<IpAddr>() {
         Ok(ip) => ip_link(ip),
+        Err(_) => esc(value),
+    }
+}
+
+/// Country badge used next to source addresses. The default styles come from
+/// the same `.tag` class as detector IDs; custom colors are generated from
+/// Settings in `/assets/country-colors.css`.
+pub fn country_badge(code: &str) -> String {
+    let code = code.trim();
+    if code.is_empty() {
+        return String::new();
+    }
+    let code = esc(code);
+    format!(r#"<span class="tag country-tag country-{code}">{code}</span>"#)
+}
+
+pub fn ip_with_country(ip: IpAddr, geo: &GeoData) -> String {
+    let mut out = ip_link(ip);
+    if let Some(country) = geo.lookup(ip).country {
+        out.push(' ');
+        out.push_str(&country_badge(&country));
+    }
+    out
+}
+
+pub fn ip_text_with_country(value: &str, geo: &GeoData) -> String {
+    match value.parse::<IpAddr>() {
+        Ok(ip) => ip_with_country(ip, geo),
         Err(_) => esc(value),
     }
 }
@@ -256,6 +286,7 @@ fn shell(page: &Page<'_>, active: &str, title: &str, body: &str) -> String {
 <title>{title} — RustIPS</title>
 <script src="/assets/theme.js"></script>
 <link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/country-colors.css">
 <script src="/assets/app.js" defer></script>
 </head>
 <body data-live="1">
@@ -535,7 +566,7 @@ sidecars.</p>
     )
 }
 
-pub fn dashboard(page: &Page<'_>, dash: &Dash<'_>) -> String {
+pub fn dashboard(page: &Page<'_>, dash: &Dash<'_>, geo: &GeoData) -> String {
     let mut body = String::new();
     let _ = write!(
         body,
@@ -622,7 +653,7 @@ kernel packets: <span class="mono" data-field="kernel-packets">{kernel}</span></
             ts = esc(&time(det.first_seen)),
             id = det.detector,
             title = esc(det.detector.title()),
-            src = ip_link(det.src),
+            src = ip_with_country(det.src, geo),
             dst = esc(&det.dst.map(|d| d.to_string()).unwrap_or_default()),
             count = det.count,
         );
@@ -644,7 +675,7 @@ kernel packets: <span class="mono" data-field="kernel-packets">{kernel}</span></
         let _ = write!(
             sources,
             r#"<li><span class="mono">{}</span><span class="num">{}</span></li>"#,
-            ip_text_or_link(src),
+            ip_text_with_country(src, geo),
             count
         );
     }
@@ -860,9 +891,10 @@ pub fn ip_history(page: &Page<'_>, history: &IpHistory<'_>) -> String {
         );
     }
 
+    let header_badge = history.country.map(country_badge).unwrap_or_default();
     format!(
         r#"<div class="ip-history">
-<h2 class="mono">{ip}</h2>
+<h2 class="mono">{ip} {header_badge}</h2>
 {status}
 <div class="ip-summary">
 <div><span class="stat-label">Country (ISO)</span><div>{country}</div></div>
@@ -904,7 +936,7 @@ pub fn ip_history(page: &Page<'_>, history: &IpHistory<'_>) -> String {
     )
 }
 
-pub fn detection_rows(page: &Page<'_>, rows: &[Detection]) -> String {
+pub fn detection_rows(page: &Page<'_>, rows: &[Detection], geo: &GeoData) -> String {
     let mut out = String::new();
     for det in rows {
         let dst = match (det.dst, det.dst_port) {
@@ -919,7 +951,7 @@ pub fn detection_rows(page: &Page<'_>, rows: &[Detection]) -> String {
             "—".into()
         };
         let src_display = if has_source {
-            ip_link(det.src)
+            ip_with_country(det.src, geo)
         } else {
             "—".into()
         };
@@ -971,6 +1003,7 @@ pub fn detections(
     pages: u32,
     total: i64,
     detector: &str,
+    geo: &GeoData,
 ) -> String {
     let mut options = String::from(r#"<option value="">All detectors</option>"#);
     for d in Detector::ALL {
@@ -1026,7 +1059,7 @@ pub fn detections(
         total = total,
         page_no = page_no,
         pages = pages,
-        rows = detection_rows(page, rows),
+        rows = detection_rows(page, rows, geo),
         pager = pager
     );
     shell(page, "/detections", "Detections", &body)
@@ -1070,6 +1103,7 @@ pub fn logs(
     origin: &str,
     search: &str,
     status: &LogStatus<'_>,
+    geo: &GeoData,
 ) -> String {
     let mut body_rows = String::new();
     for (event, detector) in rows {
@@ -1079,7 +1113,10 @@ pub fn logs(
             .or(event.identifier.as_deref())
             .unwrap_or("—");
         let user = event.user.as_deref().unwrap_or("—");
-        let source = event.src_ip.map(ip_link).unwrap_or_else(|| "—".into());
+        let source = event
+            .src_ip
+            .map(|ip| ip_with_country(ip, geo))
+            .unwrap_or_else(|| "—".into());
         let priority = event
             .priority
             .map(|p| p.to_string())
@@ -1602,7 +1639,12 @@ pub fn rule_history(page: &Page<'_>, rule_id: Option<u32>, revisions: &[RuleRevi
     shell(page, "/rules", &title, &body)
 }
 
-pub fn rule_check(page: &Page<'_>, rows: &[(Detection, Decision)], errors: &[RuleError]) -> String {
+pub fn rule_check(
+    page: &Page<'_>,
+    rows: &[(Detection, Decision)],
+    errors: &[RuleError],
+    geo: &GeoData,
+) -> String {
     let failure = if errors.is_empty() {
         String::new()
     } else {
@@ -1629,7 +1671,7 @@ pub fn rule_check(page: &Page<'_>, rows: &[(Detection, Decision)], errors: &[Rul
 </tr>"#,
             ts = esc(&time(detection.last_seen)),
             detector = detection.detector,
-            src = ip_link(detection.src),
+            src = ip_with_country(detection.src, geo),
             count = detection.count,
             matched = esc(&decision.matched_label()),
             winner = decision
@@ -2112,6 +2154,7 @@ pub fn alerts(
     stats: &crate::db::AlertStats,
     rows: &[crate::db::AlertRecord],
     notice: Option<&str>,
+    geo: &GeoData,
 ) -> String {
     let flash = notice
         .map(|text| format!(r#"<p class="flash">{}</p>"#, esc(text)))
@@ -2226,7 +2269,7 @@ least one webhook target below.</div>"#
             attempts = row.attempts,
             next = esc(&time(row.next_attempt)),
             kind = esc(&kind),
-            src = esc(src),
+            src = ip_text_with_country(src, geo),
             action = esc(action),
             rule = esc(rule),
             pretty = esc(&pretty),
@@ -2302,7 +2345,7 @@ least one webhook target below.</div>"#
 
 // -------------------------------------------------------------------- blocks
 
-pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>) -> String {
+pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>, geo: &GeoData) -> String {
     let mut out = String::new();
     for block in rows {
         let _ = write!(
@@ -2318,7 +2361,7 @@ pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>) -> String
 {csrf}<input type="hidden" name="src" value="{src_raw}">
 <button class="small danger">Unblock</button></form></td>
 </tr>"#,
-            src = ip_link(block.src),
+            src = ip_with_country(block.src, geo),
             src_text = esc(&block.src.to_string()),
             src_raw = esc(&block.src.to_string()),
             reason = esc(&block.reason),
@@ -2335,7 +2378,7 @@ pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>) -> String
     out
 }
 
-pub fn blocks(page: &Page<'_>, rows: &[Block], notice: Option<&str>) -> String {
+pub fn blocks(page: &Page<'_>, rows: &[Block], notice: Option<&str>, geo: &GeoData) -> String {
     let flash = notice
         .map(|n| format!(r#"<p class="flash">{}</p>"#, esc(n)))
         .unwrap_or_default();
@@ -2367,20 +2410,20 @@ pub fn blocks(page: &Page<'_>, rows: &[Block], notice: Option<&str>) -> String {
         } else {
             "dry run (observe mode) — the block is recorded but not applied"
         },
-        rows = block_rows(page, rows, Utc::now()),
+        rows = block_rows(page, rows, Utc::now(), geo),
         csrf = csrf_input(page)
     );
     shell(page, "/blocks", "Active blocks", &body)
 }
 
-pub fn history(page: &Page<'_>, rows: &[Block]) -> String {
+pub fn history(page: &Page<'_>, rows: &[Block], geo: &GeoData) -> String {
     let mut body = String::new();
     for block in rows {
         let _ = write!(
             body,
             r#"<tr><td class="mono">{src}</td><td>{reason}</td><td>{detector}</td>
 <td class="mono">{started}</td><td class="mono">{expiry}</td><td>{state}</td><td>{strike}</td></tr>"#,
-            src = ip_link(block.src),
+            src = ip_with_country(block.src, geo),
             reason = esc(&block.reason),
             detector = block
                 .detector
@@ -2417,7 +2460,7 @@ pub fn history(page: &Page<'_>, rows: &[Block]) -> String {
 
 // ------------------------------------------------------------------- strikes
 
-pub fn strikes(page: &Page<'_>, rows: &[Strike], cfg: &Config) -> String {
+pub fn strikes(page: &Page<'_>, rows: &[Strike], cfg: &Config, geo: &GeoData) -> String {
     let mut body = String::new();
     let steps = &cfg.ladder.steps;
     for strike in rows {
@@ -2431,7 +2474,7 @@ pub fn strikes(page: &Page<'_>, rows: &[Strike], cfg: &Config) -> String {
             body,
             r#"<tr><td class="mono">{src}</td><td>{count}</td><td class="mono">{first}</td>
 <td class="mono">{last}</td><td>{reason}</td><td>{next}</td></tr>"#,
-            src = ip_link(strike.src),
+            src = ip_with_country(strike.src, geo),
             count = strike.count,
             first = esc(&time(strike.first_seen)),
             last = esc(&time(strike.last_seen)),
@@ -2524,6 +2567,12 @@ pub fn settings(
     cfg: &Config,
     overrides: &[(String, serde_json::Value)],
     detection_overrides: &BTreeMap<String, String>,
+    country_colors: &CountryColors,
+    country_default: &CountryColor,
+    country_loaded: bool,
+    edit_code: &str,
+    edit_background: &str,
+    edit_foreground: &str,
     users: &[String],
     bind_value: &str,
     port_value: u16,
@@ -2548,6 +2597,43 @@ pub fn settings(
         override_rows.push_str(r#"<tr><td colspan="2" class="hint">No runtime overrides; the configuration file is in use.</td></tr>"#);
     }
 
+    let mut country_rows = format!(
+        r##"<tr><td><span class="tag country-tag">Default</span></td>
+<td class="mono">{background}</td><td class="mono">{foreground}</td>
+<td><a class="button small ghost" href="#country-default">Edit</a></td></tr>"##,
+        background = esc(&country_default.background),
+        foreground = esc(&country_default.foreground),
+    );
+    for (code, color) in country_colors {
+        let _ = write!(
+            country_rows,
+            r#"<tr><td>{badge}</td><td class="mono">{background}</td><td class="mono">{foreground}</td>
+<td><a class="button small ghost" href="/settings?edit={code}#country-colors">Edit</a>
+<form method="post" action="/settings/geo-colors/delete" class="inline" data-confirm="Remove the custom color for {code}?">
+{csrf}<input type="hidden" name="code" value="{code}">
+<button class="small danger">Remove</button></form></td></tr>"#,
+            badge = country_badge(code),
+            background = esc(&color.background),
+            foreground = esc(&color.foreground),
+            code = esc(code),
+            csrf = csrf_input(page),
+        );
+    }
+    if country_colors.is_empty() {
+        country_rows.push_str(r#"<tr><td colspan="4" class="hint">No country overrides yet; every country uses the default badge.</td></tr>"#);
+    }
+    let edit_button = if edit_code.is_empty() {
+        "Save country colors"
+    } else {
+        "Update country colors"
+    };
+    let cancel_edit = if edit_code.is_empty() {
+        String::new()
+    } else {
+        r#"<a class="button small ghost" href="/settings#country-colors">Cancel edit</a>"#
+            .to_string()
+    };
+
     let mut users_list = String::new();
     if users.is_empty() {
         users_list.push_str(r#"<li class="hint">No members found. Add the administrator to the group before logging in.</li>"#);
@@ -2568,7 +2654,7 @@ pub fn settings(
     }
 
     let body = format!(
-        r#"<section class="panel">
+        r##"<section class="panel">
 <h1>Settings</h1>
 {flash}
 <p class="hint">Effective binding: <span class="mono">{bind}</span>. Changes are saved to the
@@ -2637,6 +2723,36 @@ or any real service. Do not list the RustIPS web port. See
 <a href="/detectors">Detectors</a> for the DET-26 catalog entry.</p>
 </section>
 
+<section class="panel"><h2>Country badge colors</h2>
+<p class="hint">When the GeoIP country index is loaded, every source address shows its
+two-letter country tag. The default badge is black with white text unless changed
+below. Country overrides accept one or more comma-separated ISO codes and share
+one background/text color pair.</p>
+{country_note}
+<div class="scroll"><table><thead><tr><th>Preview</th><th>Background</th><th>Text</th><th></th></tr></thead>
+<tbody>{country_rows}</tbody></table></div>
+
+<h3 id="country-default">Default badge</h3>
+<form method="post" action="/settings/geo-colors/default" class="row-form">
+{csrf}
+<label>Background <input name="background" type="color" value="{default_background}" required></label>
+<label>Text <input name="foreground" type="color" value="{default_foreground}" required></label>
+<button class="primary">Save default</button>
+</form>
+
+<h3 id="country-colors">Country overrides</h3>
+<form method="post" action="/settings/geo-colors" class="row-form">
+{csrf}
+<label>Country codes <input name="code" maxlength="64" value="{edit_code}" placeholder="CN, RU, KP" required class="mono"></label>
+<label>Background <input name="background" type="color" value="{edit_background}" required></label>
+<label>Text <input name="foreground" type="color" value="{edit_foreground}" required></label>
+<button class="primary">{edit_button}</button>
+{cancel_edit}
+</form>
+<p class="hint">Use comma-separated two-letter ISO 3166-1 codes. Re-saving a code
+updates it. Colors are stored in SQLite and apply immediately.</p>
+</section>
+
 <section class="panel"><h2>Storage and runtime</h2>
 <ul class="plain">
 <li>Mode: <span class="mono">{mode}</span> · capture interfaces: <span class="mono">{ifaces}</span></li>
@@ -2653,7 +2769,7 @@ or any real service. Do not list the RustIPS web port. See
 </ul>
 <p class="hint">Add, edit and remove webhook targets on the <a href="/alerts">Alerts</a> page.
 Delivery is asynchronous and uses the system <span class="mono">curl</span>.</p>
-</section>"#,
+</section>"##,
         flash = flash,
         bind = esc(&page.bind.to_string()),
         bind_value = esc(bind_value),
@@ -2690,6 +2806,19 @@ Delivery is asynchronous and uses the system <span class="mono">curl</span>.</p>
                 .join(", ")
         },
         ladder = ladder,
+        country_note = if country_loaded {
+            r#"<p class="hint"><strong>GeoIP country index loaded.</strong></p>"#
+        } else {
+            r#"<div class="banner warn"><strong>GeoIP country index is not loaded.</strong> Country tags will appear after a successful <span class="mono">rustips geo update</span>.</div>"#
+        },
+        country_rows = country_rows,
+        default_background = esc(&country_default.background),
+        default_foreground = esc(&country_default.foreground),
+        edit_code = esc(edit_code),
+        edit_background = esc(edit_background),
+        edit_foreground = esc(edit_foreground),
+        edit_button = edit_button,
+        cancel_edit = cancel_edit,
         honeypot_form = params_form(
             page,
             "honeypot",
@@ -2806,7 +2935,8 @@ mod tests {
             evidence_log_id: None,
             id: Some(1),
         };
-        let html = detection_rows(&page, std::slice::from_ref(&det));
+        let geo = crate::geo::GeoData::default();
+        let html = detection_rows(&page, std::slice::from_ref(&det), &geo);
         assert!(!html.contains("<b>owned</b>"));
         assert!(html.contains("&lt;b&gt;owned&lt;/b&gt;"));
         assert!(html.contains("DET-01"));

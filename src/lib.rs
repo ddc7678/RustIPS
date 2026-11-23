@@ -5,6 +5,7 @@ pub mod auth;
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod countries;
 pub mod daemon;
 pub mod db;
 pub mod decode;

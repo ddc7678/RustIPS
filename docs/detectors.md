@@ -101,6 +101,19 @@ detector enable/disable, and are not included in export/import. Removing an
 override falls back to the configuration file value (the page labels the
 built-in default separately).
 
+## Source country badges
+
+When the GeoIP country index is loaded, every source address in the web UI is
+followed by its ISO country code, for example `203.0.113.7 [US]`. This applies
+to the dashboard, Detections, Logs, blocks, history, strikes, rule dry-run and
+the IP-history dialog. The default badge is black with white text.
+
+Administrators can edit the default colors and set overrides for one or more
+comma-separated two-letter country codes in **Settings → Country badge colors**.
+Colors are stored in SQLite and emitted by the generated
+`/assets/country-colors.css` stylesheet, so the strict CSP still forbids inline
+styles.
+
 ## Honeypot (DET-26)
 
 The honeypot is **disabled by default**. Configure it in **Settings → Honeypot**:

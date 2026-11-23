@@ -76,6 +76,11 @@ existing CSRF-protected `/blocks/add` form. The 0.3.13 `/api/system` resource
 graphs endpoint is likewise authenticated and read-only; it serves only
 aggregated process CPU/memory and database-size samples.
 
+The 0.3.15 country-badge colors are accepted only as a two-letter ISO code and
+`#rrggbb` values. They are emitted as a generated same-origin stylesheet rather
+than inline styles, so the strict CSP remains in force; malformed stored entries
+are skipped.
+
 ## Network and web exposure
 
 * Loopback bind by default; a non-loopback bind requires an explicit checkbox,

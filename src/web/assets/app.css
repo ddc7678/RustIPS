@@ -232,6 +232,7 @@ pre { background: var(--panel-2); padding: 10px; border-radius: var(--radius); o
 }
 .tag.danger { background: #421514; color: #ffb3ae; }
 .tag.warn { background: #3a2a0a; color: #f0c674; }
+.country-tag { margin-left: 4px; text-transform: uppercase; background: #000; color: #fff; }
 
 .flash {
   background: var(--accent-2);

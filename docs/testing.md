@@ -25,7 +25,7 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-The suite is currently 160 tests: 146 library tests, one pcap replay test
+The suite is currently 162 tests: 148 library tests, one pcap replay test
 (`tests/replay.rs`), three robustness tests (`tests/robustness.rs`), two
 webhook delivery tests (`tests/alerts.rs`), six CLI first-run/recovery/override
 tests (`tests/cli.rs`), one coverage scorecard (`tests/scorecard.rs`) and one
@@ -42,8 +42,8 @@ single-button detector state toggles, editing and resetting
 `http_bad_paths`/`http_login_paths`, rejection of an out-of-range value, the
 reset-one/group/all actions, collapsible grouped navigation, flash-free theme
 delivery, single-button detector/rule state toggles, honeypot
-validation/save/reset, the clickable IP-history API/dialog, resource-graph
-sampling/API and the left sidebar.
+validation/save/reset, the clickable IP-history API/dialog, GeoIP country
+badges/custom colors, resource-graph sampling/API and the left sidebar.
 
 To run just one area:
 

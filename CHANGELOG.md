@@ -23,6 +23,41 @@ are fixes within an iteration.
   rules-table layout fix. A 0.4.x line is opened only on an explicit decision
   (`requirements.md` §14).
 
+## [0.3.15] — 2026-11-22
+
+GeoIP country badges beside source addresses, with administrator-defined colors.
+
+### Added
+
+- When the GeoIP country index is loaded, every source address display shows
+  its ISO country tag: dashboard recent detections and top sources, Detections,
+  Logs, Active blocks, Block history, Strikes, rule dry-run and the IP-history
+  dialog.
+- Country badges default to **black background with white text**.
+- Settings **Country badge colors** panel: edit the default color; add, update
+  or remove overrides for one or more comma-separated two-letter country codes.
+  Entries are stored in `settings.geo.country_colors`, the default in
+  `settings.geo.country_default`, and both are rendered through the generated
+  `/assets/country-colors.css` stylesheet, preserving the strict CSP.
+- Live dashboard JSON now includes country codes for recent detections and top
+  sources, so the 2-second refresh keeps badges visible.
+- `docs/iterations/0.3.15.md` and `docs/coverage/0.3.15.{md,json}`.
+
+### Changed
+
+- Cargo version is now 0.3.15. No schema change (v10).
+
+### Verified
+
+- 162 tests pass (148 library, 6 CLI, 2 webhook, 1 replay, 3 robustness,
+  1 scorecard, 1 web); clippy/fmt clean.
+- Web test builds a country GeoIP index, sees `US` badges on dashboard/
+  detections/IP history, saves a custom US color, edits the default color,
+  applies comma-separated `CN, RU` colors, verifies generated CSS and edit
+  prefill, rejects invalid input and removes an override.
+- Country color validation accepts only a two-letter code and `#rrggbb`
+  values; CSS is generated from validated values only.
+
 ## [0.3.14] — 2026-11-22
 
 ### Fixed
