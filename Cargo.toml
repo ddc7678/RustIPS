@@ -1,6 +1,6 @@
 [package]
 name = "rustips"
-version = "0.3.15"
+version = "0.3.19"
 edition = "2024"
 rust-version = "1.85"
 description = "RustIPS - a small, fast intrusion prevention system for a single host"

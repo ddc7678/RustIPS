@@ -4,10 +4,77 @@ All notable changes to RustIPS are recorded here. The project follows
 `MAJOR.MINOR.PATCH`; pre-1.0 minor releases are iterations, and patch releases
 are fixes within an iteration.
 
-## [Unreleased]
+## [0.3.19] — 2026-11-24
+
+### Fixed
+
+- The Active Drops live refresh (`/partial/blocks`) now filters permanent
+  blocks, so permanent drops no longer appear in the Active Drops tab after the
+  two-second refresh.
+
+## [0.3.18] — 2026-11-24
 
 ### Added
 
+- Firewall **Permanent Drops** tab: permanent active blocks are separated from
+  expiring Active Drops.
+- **External System Services** and **Internal System Services** tabs. External
+  services are reachable beyond loopback; internal services are loopback-only
+  and shown for visibility without a drop toggle.
+
+### Changed
+
+- System service tables drop the separate **Status** and **Mode** columns. The
+  allow/drop toggle is the mode, and newly discovered services are highlighted
+  in yellow until acknowledged or toggled.
+- Cargo version is now 0.3.18.
+
+## [0.3.17] — 2026-11-24
+
+### Added
+
+- The Firewall page is now tabbed: **Active Drops**, **Admin Drops**,
+  **System Services** and **Honeypot**.
+- **Active Drops** replaces the separate Active blocks page. `/blocks`
+  redirects to the first tab, and block/unblock actions return there.
+- **Admin Drops** supports add/edit/delete/enable/disable rules with optional
+  source CIDR/IP, destination CIDR/IP, protocol and single port. Rules are
+  applied ahead of established connections and service allows.
+- **System Services** records every discovered service, defaults it to allow,
+  flags newly discovered services as **new** until acknowledged, and provides a
+  per-service drop toggle. Dropped services get an explicit drop rule ahead of
+  the allow rules.
+- **Honeypot** now owns the DET-26 enable/threshold form and adds add/edit/delete
+  controls for individual honeypot ports. Firewall allow rules follow port
+  changes immediately; DET-26 still restarts to watch new ports.
+- Firewall settings moved into a distinct settings card below the tabs.
+
+### Changed
+
+- Schema v12 adds `firewall_admin_rules` and `firewall_services`.
+- Cargo version is now 0.3.17.
+- Honeypot settings are no longer rendered on the Settings page; Settings links
+  to the Firewall Honeypot tab.
+
+## [0.3.16] — 2026-11-23
+
+### Added
+
+- Optional **service firewall** (disabled by default) on a new `/firewall`
+  page. When enabled it keeps blocked-source rules, accepts established/related
+  traffic and loopback, generates allow rules from the host's listening
+  TCP/UDP services, pinned ports and enabled honeypot ports, then logs and
+  drops or rejects every other inbound packet.
+- **DET-27 Firewall default-drop**: the final firewall rule logs through the
+  nftables kernel prefix `rustips-fw-drop`; journal ingestion turns those lines
+  into alert-only detections with a shipped disposition rule and a one-time
+  database migration for existing installations.
+- Firewall state uses the same single-button enable/disable control as
+  detectors and applies live. Discovery refresh, extra TCP/UDP ports, whether
+  honeypot ports are included, drop logging and drop-vs-reject are editable in
+  the UI and stored in `settings.firewall.settings`.
+- `rustips check` reports the effective firewall state, discovery health and
+  the observe-mode warning. `docs/firewall.md` documents safety and operation.
 - GitHub release workflow for `v*` tags: builds the Linux x86_64 binary, runs
   the coverage scorecard, and publishes the binary, checksum and scorecard as
   release assets.
@@ -19,9 +86,12 @@ are fixes within an iteration.
   distribution + first run 0.3.5, release candidate 0.3.6, detector
   catalog/sidebar 0.3.7, detector scope/parameters 0.3.8,
   navigation/theme/honeypot 0.3.9, menu/state cleanup 0.3.10, IP history
-  0.3.11, the 0.3.12 Active-blocks fix, 0.3.13 resource graphs and the 0.3.14
-  rules-table layout fix. A 0.4.x line is opened only on an explicit decision
+  0.3.11, the 0.3.12 Active-blocks fix, 0.3.13 resource graphs, the 0.3.14
+  rules-table layout fix, 0.3.15 country badges and the 0.3.16 optional service
+  firewall. A 0.4.x line is opened only on an explicit decision
   (`requirements.md` §14).
+- Cargo version is now 0.3.16. Schema v11 adds the shipped DET-27 alert rule;
+  existing databases migrate automatically on first open.
 
 ## [0.3.15] — 2026-11-22
 

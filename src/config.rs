@@ -119,6 +119,8 @@ pub struct Config {
     #[serde(default)]
     pub enforcement: Enforcement,
     #[serde(default)]
+    pub firewall: Firewall,
+    #[serde(default)]
     pub ladder: Ladder,
     #[serde(default)]
     pub detection: Detection,
@@ -189,6 +191,66 @@ impl Default for Enforcement {
             table: "rustips".into(),
             priority: -10,
             chain_hook: "input".into(),
+        }
+    }
+}
+
+/// Optional host-firewall mode (disabled by default).
+///
+/// When enabled, RustIPS makes its input chain a real firewall: it generates
+/// allow rules for the services that are currently listening on the host plus
+/// any configured extra/honeypot ports, then logs and drops or rejects every
+/// other inbound packet. This is deliberately separate from the always-on
+/// blocked-source rules, which remain in force either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Firewall {
+    /// Master switch. The UI stores this as a live database setting so it can
+    /// be toggled without restarting the daemon.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Discover listening TCP/UDP services from `/proc/net` on every refresh.
+    #[serde(default = "default_true")]
+    pub discover_services: bool,
+    /// How often listening services are re-discovered.
+    #[serde(default = "default_firewall_refresh")]
+    pub refresh_secs: u64,
+    /// Extra TCP ports to allow even when nothing is listening yet.
+    #[serde(default)]
+    pub allow_tcp_ports: Vec<u16>,
+    /// Extra UDP ports to allow even when nothing is listening yet.
+    #[serde(default)]
+    pub allow_udp_ports: Vec<u16>,
+    /// Allow configured honeypot ports so DET-26 can see contacts.
+    #[serde(default = "default_true")]
+    pub include_honeypot: bool,
+    /// Log dropped packets to the new DET-27 detector before dropping them.
+    #[serde(default = "default_true")]
+    pub log_drops: bool,
+    /// Reject instead of silently dropping. Rejection is logged the same way.
+    #[serde(default)]
+    pub reject: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_firewall_refresh() -> u64 {
+    30
+}
+
+impl Default for Firewall {
+    fn default() -> Self {
+        Firewall {
+            enabled: false,
+            discover_services: true,
+            refresh_secs: default_firewall_refresh(),
+            allow_tcp_ports: Vec::new(),
+            allow_udp_ports: Vec::new(),
+            include_honeypot: true,
+            log_drops: true,
+            reject: false,
         }
     }
 }
@@ -877,6 +939,15 @@ impl Config {
                 "enforcement.table must be alphanumeric/underscore".into(),
             ));
         }
+        if self.firewall.refresh_secs == 0 {
+            return Err(Error::Config("firewall.refresh_secs must be > 0".into()));
+        }
+        if self.firewall.allow_tcp_ports.contains(&0) || self.firewall.allow_udp_ports.contains(&0)
+        {
+            return Err(Error::Config(
+                "firewall allow ports must be 1..=65535".into(),
+            ));
+        }
         self.web.bind.parse::<std::net::IpAddr>().map_err(|_| {
             Error::Config(format!("web.bind {:?} is not an IP address", self.web.bind))
         })?;
@@ -980,6 +1051,20 @@ rcvbuf_bytes = 8388608
 table = "rustips"
 priority = -10
 chain_hook = "input"
+
+[firewall]
+# Optional host firewall. Disabled by default. When enabled, RustIPS keeps the
+# blocked-source rules, adds allow rules for listening services and optional
+# extra ports, then logs drops/rejects to DET-27 as the final rule.
+enabled = false
+discover_services = true
+refresh_secs = 30
+allow_tcp_ports = []
+allow_udp_ports = []
+# Make honeypot ports reachable so DET-26 can detect contacts to them.
+include_honeypot = true
+log_drops = true
+reject = false
 
 [ladder]
 # Strike 1..5. After the last step, repeat the last step.
@@ -1161,6 +1246,26 @@ mod tests {
         assert_eq!(cfg.web.bind, "127.0.0.1");
         assert_eq!(cfg.web.port, 10707);
         assert_eq!(cfg.web.admin_group, "rustips-admin");
+    }
+
+    #[test]
+    fn firewall_defaults_disabled_and_parses_without_section() {
+        let cfg = Config::parse(Path::new("test.toml"), DEFAULT_CONFIG_TOML).unwrap();
+        assert!(!cfg.firewall.enabled);
+        assert!(cfg.firewall.discover_services);
+        assert_eq!(cfg.firewall.refresh_secs, 30);
+        assert!(cfg.firewall.log_drops);
+
+        let start = DEFAULT_CONFIG_TOML.find("[firewall]").unwrap();
+        let end = DEFAULT_CONFIG_TOML.find("[ladder]").unwrap();
+        let text = format!(
+            "{}{}",
+            &DEFAULT_CONFIG_TOML[..start],
+            &DEFAULT_CONFIG_TOML[end..]
+        );
+        let cfg = Config::parse(Path::new("test.toml"), &text).unwrap();
+        assert!(!cfg.firewall.enabled);
+        assert_eq!(cfg.firewall, Firewall::default());
     }
 
     #[test]

@@ -11,9 +11,10 @@ use std::net::{IpAddr, SocketAddr};
 
 use chrono::{DateTime, Utc};
 
-use crate::config::{BlockDuration, Config, Mode, UnblockEffect};
+use crate::config::{BlockDuration, Config, Firewall, Mode, UnblockEffect};
 use crate::countries::{CountryColor, CountryColors};
 use crate::db::SystemPoint;
+use crate::firewall::{self, FirewallPlan, ListeningSocket};
 use crate::geo::GeoData;
 use crate::logs::LogEvent;
 use crate::model::{AllowlistEntry, Block, BlockState, Detection, Detector, Strike};
@@ -259,7 +260,7 @@ fn shell(page: &Page<'_>, active: &str, title: &str, body: &str) -> String {
             active,
             "Enforcement",
             &[
-                ("/blocks", "Active blocks"),
+                ("/firewall", "Firewall"),
                 ("/history", "History"),
                 ("/strikes", "Strikes"),
                 ("/allowlist", "Allowlist"),
@@ -1888,6 +1889,11 @@ fn detector_config_lines(det: Detector, cfg: &Config) -> Vec<String> {
         Detector::AccountModification => {
             vec!["one event: useradd/usermod/groupadd/sudoers/authorized_keys change".into()]
         }
+        Detector::FirewallDrop => vec![
+            "source: optional service firewall (nftables log prefix)".into(),
+            "one event per source per log cooldown; firewall log is rate-limited".into(),
+            "enable and tune it on the Firewall page".into(),
+        ],
         Detector::Honeypot => vec![
             format!("honeypot_enabled = {}", d.honeypot_enabled),
             format!(
@@ -2145,6 +2151,663 @@ data-confirm="Remove every stored detection parameter override? All detectors re
     shell(page, "/detectors", "Detectors", &body)
 }
 
+// ------------------------------------------------------------------- firewall
+
+pub struct FirewallView<'a> {
+    pub tab: &'a str,
+    pub settings: &'a Firewall,
+    pub plan: &'a FirewallPlan,
+    pub listening: &'a [ListeningSocket],
+    pub service_states: &'a [crate::db::FirewallServiceRow],
+    pub admin_rules: &'a [crate::db::AdminDropRow],
+    pub edit_admin: Option<&'a crate::db::AdminDropRow>,
+    pub active_blocks: &'a [Block],
+    pub permanent_blocks: &'a [Block],
+    pub cfg: &'a Config,
+    pub detection_overrides: &'a BTreeMap<String, String>,
+    pub honeypot_enabled: bool,
+    pub honeypot_ports: &'a [u16],
+    pub honeypot_hits: usize,
+    pub geo: &'a GeoData,
+    pub discovery_error: Option<&'a str>,
+    pub notice: Option<&'a str>,
+}
+
+fn firewall_tab_link(active: &str, id: &str, label: &str, count: usize) -> String {
+    format!(
+        r#"<a class="tab{active}" href="/firewall?tab={id}">{label}<span class="tab-count">{count}</span></a>"#,
+        active = if active == id { " active" } else { "" },
+        id = esc(id),
+        label = esc(label),
+        count = count,
+    )
+}
+
+fn firewall_tabs(
+    active: &str,
+    block_count: usize,
+    permanent_count: usize,
+    admin_count: usize,
+    external_count: usize,
+    internal_count: usize,
+    honeypot_count: usize,
+) -> String {
+    format!(
+        r#"<nav class="tabs" aria-label="Firewall sections">{}{}{}{}{}{}</nav>"#,
+        firewall_tab_link(active, "active", "Active Drops", block_count),
+        firewall_tab_link(active, "permanent", "Permanent Drops", permanent_count),
+        firewall_tab_link(active, "admin", "Admin Drops", admin_count),
+        firewall_tab_link(
+            active,
+            "external",
+            "External System Services",
+            external_count
+        ),
+        firewall_tab_link(
+            active,
+            "internal",
+            "Internal System Services",
+            internal_count
+        ),
+        firewall_tab_link(active, "honeypot", "Honeypot", honeypot_count),
+    )
+}
+
+fn active_drops_tab(page: &Page<'_>, rows: &[Block], geo: &GeoData, permanent: bool) -> String {
+    let body = if rows.is_empty() {
+        let hint = if permanent {
+            "No permanent RustIPS-generated drops are active."
+        } else {
+            "No temporary RustIPS-generated drops are active."
+        };
+        format!(r#"<tr><td colspan="7" class="hint">{hint}</td></tr>"#)
+    } else {
+        block_rows(
+            page,
+            rows,
+            Utc::now(),
+            geo,
+            if permanent { "permanent" } else { "active" },
+        )
+    };
+    let title = if permanent {
+        "Permanent RustIPS drops"
+    } else {
+        "Temporary RustIPS drops"
+    };
+    let hint = if permanent {
+        "Permanent blocks do not expire until an administrator unblocks them. They are owned by the daemon."
+    } else {
+        "Temporary blocks created by the detection ladder or a manual block. Expiry is owned by the daemon, not by a kernel timeout."
+    };
+    let manual = if permanent {
+        r#"<p class="hint">To create a permanent drop, use the manual form on Active Drops with 0 minutes.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<h3>Manual drop</h3>
+<form method="post" action="/blocks/add" class="row-form">
+{csrf}
+<label>Source <input name="src" placeholder="203.0.113.7" required class="mono"></label>
+<label>Minutes <input name="minutes" type="number" min="0" value="60" class="short"></label>
+<label>Reason <input name="reason" value="manual block" maxlength="200"></label>
+<button class="primary">Block</button>
+</form>
+<p class="hint">Zero minutes means permanent. Loopback, private and the host's own addresses cannot be blocked.</p>"#,
+            csrf = csrf_input(page),
+        )
+    };
+    format!(
+        r#"<h2>{title}</h2>
+<p class="hint">{hint} Enforcement: {enforcement}.</p>
+<div class="scroll"><table>
+<thead><tr><th>Source</th><th>Reason</th><th>Detector</th><th>Strike</th><th>Started (UTC)</th><th>Remaining</th><th></th></tr></thead>
+<tbody id="live-table">{body}</tbody></table></div>
+<p class="hint">This table refreshes every 2 seconds. Unblocking removes the source set element.</p>
+{manual}"#,
+        title = title,
+        hint = hint,
+        enforcement = if page.mode == Mode::Enforce {
+            "nftables"
+        } else {
+            "dry run (observe mode) — the block is recorded but not applied"
+        },
+        body = body,
+        manual = manual,
+    )
+}
+
+fn admin_drops_tab(
+    page: &Page<'_>,
+    rules: &[crate::db::AdminDropRow],
+    edit: Option<&crate::db::AdminDropRow>,
+) -> String {
+    let mut rows = String::new();
+    for rule in rules {
+        let _ = write!(
+            rows,
+            r#"<tr>
+<td class="mono">{src}</td><td class="mono">{dst}</td><td class="mono">{proto}</td>
+<td class="mono">{port}</td><td>{enabled}</td><td>{actor}</td>
+<td class="inline-actions">
+<form method="post" action="/firewall/admin/toggle" class="inline">
+{csrf}<input type="hidden" name="id" value="{id}">
+<input type="hidden" name="enable" value="{next}">
+<button class="small {toggle_class}">{toggle_label}</button></form>
+<a class="button small ghost" href="/firewall?tab=admin&edit={id}">Edit</a>
+<form method="post" action="/firewall/admin/delete" class="inline" data-confirm="Delete this admin drop rule?">
+{csrf}<input type="hidden" name="id" value="{id}">
+<button class="small danger">Delete</button></form>
+</td></tr>"#,
+            src = esc(rule.src.as_deref().unwrap_or("any")),
+            dst = esc(rule.dst.as_deref().unwrap_or("any")),
+            proto = esc(&rule.proto),
+            port = rule
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "any".into()),
+            enabled = if rule.enabled {
+                r#"<span class="tag good">enabled</span>"#
+            } else {
+                r#"<span class="tag warn">disabled</span>"#
+            },
+            actor = esc(&rule.created_by),
+            id = rule.id,
+            next = if rule.enabled { "no" } else { "yes" },
+            toggle_class = if rule.enabled { "ghost" } else { "primary" },
+            toggle_label = if rule.enabled { "Disable" } else { "Enable" },
+            csrf = csrf_input(page),
+        );
+    }
+    if rows.is_empty() {
+        rows.push_str(r#"<tr><td colspan="7" class="hint">No admin drop rules yet. Traffic matching these rules is dropped before established connections and service allows.</td></tr>"#);
+    }
+
+    let edit_id = edit.map(|rule| rule.id).unwrap_or(0);
+    let src = edit.and_then(|rule| rule.src.as_deref()).unwrap_or("");
+    let dst = edit.and_then(|rule| rule.dst.as_deref()).unwrap_or("");
+    let proto = edit.map(|rule| rule.proto.as_str()).unwrap_or("any");
+    let port = edit
+        .and_then(|rule| rule.port)
+        .map(|port| port.to_string())
+        .unwrap_or_default();
+    let enabled = edit.map(|rule| rule.enabled).unwrap_or(true);
+    let form_title = if edit_id == 0 {
+        "Add admin drop"
+    } else {
+        "Edit admin drop"
+    };
+    let cancel = if edit_id == 0 {
+        String::new()
+    } else {
+        r#"<a class="button small ghost" href="/firewall?tab=admin">Cancel edit</a>"#.to_string()
+    };
+    let proto_option = |value: &str, label: &str| {
+        format!(
+            r#"<option value="{value}"{selected}>{label}</option>"#,
+            selected = if proto == value { " selected" } else { "" }
+        )
+    };
+
+    format!(
+        r#"<h2>Admin drops</h2>
+<p class="hint">Explicit rules with optional source, destination, protocol and port. Enabled rules are
+written ahead of established connections and generated service allows, so they can override a
+service. Loopback is accepted first to protect the local UI. Rules only apply while the firewall
+is enabled in enforce mode.</p>
+<div class="scroll"><table>
+<thead><tr><th>Source</th><th>Destination</th><th>Protocol</th><th>Port</th><th>State</th><th>Created by</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div>
+<h3>{form_title}</h3>
+<form method="post" action="/firewall/admin/save" class="params">
+{csrf}<input type="hidden" name="id" value="{edit_id}">
+<div class="param-grid">
+<div class="param"><label>Source (IP/CIDR, blank = any)</label>
+<input name="src" value="{src}" placeholder="203.0.113.0/24" class="mono"></div>
+<div class="param"><label>Destination (IP/CIDR, blank = any)</label>
+<input name="dst" value="{dst}" placeholder="192.0.2.10" class="mono"></div>
+<div class="param"><label>Protocol</label>
+<select name="proto">{proto_any}{proto_tcp}{proto_udp}{proto_icmp}{proto_icmp6}</select></div>
+<div class="param"><label>Port (optional, TCP/UDP only)</label>
+<input name="port" type="number" min="1" max="65535" value="{port}" class="short"></div>
+<div class="param"><label class="check"><input type="hidden" name="enabled" value="false">
+<input type="checkbox" name="enabled" value="true"{enabled_checked}> enabled</label>
+<div class="hint">Disabled rules are kept but not applied.</div></div>
+</div>
+<div class="actions"><button class="primary small">{save_label}</button>{cancel}</div>
+</form>"#,
+        rows = rows,
+        form_title = form_title,
+        csrf = csrf_input(page),
+        edit_id = edit_id,
+        src = esc(src),
+        dst = esc(dst),
+        port = esc(&port),
+        proto_any = proto_option("any", "any"),
+        proto_tcp = proto_option("tcp", "tcp"),
+        proto_udp = proto_option("udp", "udp"),
+        proto_icmp = proto_option("icmp", "icmp"),
+        proto_icmp6 = proto_option("icmp6", "icmpv6"),
+        enabled_checked = if enabled { " checked" } else { "" },
+        save_label = if edit_id == 0 {
+            "Add rule"
+        } else {
+            "Save changes"
+        },
+        cancel = cancel,
+    )
+}
+
+fn service_state<'a>(
+    states: &'a [crate::db::FirewallServiceRow],
+    socket: &ListeningSocket,
+) -> Option<&'a crate::db::FirewallServiceRow> {
+    states.iter().find(|state| {
+        state.proto.eq_ignore_ascii_case(socket.proto.as_str())
+            && state.port == socket.port
+            && state.addr == socket.addr
+    })
+}
+
+fn is_internal_service(socket: &ListeningSocket) -> bool {
+    socket.addr.is_some_and(|addr| addr.is_loopback())
+}
+
+fn services_tab(
+    page: &Page<'_>,
+    listening: &[ListeningSocket],
+    states: &[crate::db::FirewallServiceRow],
+    internal: bool,
+) -> String {
+    let mut rows = String::new();
+    let mut new_count = 0usize;
+    for socket in listening
+        .iter()
+        .filter(|socket| is_internal_service(socket) == internal)
+    {
+        let state = service_state(states, socket);
+        let dropped = state.is_some_and(|state| state.dropped);
+        let new = state.is_none_or(|state| !state.acknowledged);
+        if new {
+            new_count += 1;
+        }
+        let name = firewall::service_name(socket.port, socket.proto);
+        let bind = match socket.addr {
+            None => "all local addresses".to_string(),
+            Some(addr) => addr.to_string(),
+        };
+        let first_seen = state
+            .map(|state| time(state.first_seen))
+            .unwrap_or_else(|| "—".into());
+        let control = if internal {
+            r#"<span class="hint">loopback protected</span>"#.to_string()
+        } else {
+            format!(
+                r#"<form method="post" action="/firewall/services/toggle" class="inline">
+{csrf}<input type="hidden" name="proto" value="{proto_raw}">
+<input type="hidden" name="port" value="{port}">
+<input type="hidden" name="addr" value="{addr}">
+<input type="hidden" name="drop" value="{next_drop}">
+<button class="state-toggle {state_class}" aria-pressed="{dropped}">{state_label}</button></form>"#,
+                csrf = csrf_input(page),
+                proto_raw = esc(socket.proto.as_str()),
+                port = socket.port,
+                addr = esc(&socket.addr.map(|addr| addr.to_string()).unwrap_or_default()),
+                next_drop = if dropped { "no" } else { "yes" },
+                state_class = if dropped { "state-off" } else { "state-on" },
+                state_label = if dropped { "Dropped" } else { "Allowed" },
+                dropped = dropped,
+            )
+        };
+        let _ = write!(
+            rows,
+            r#"<tr class="{row_class}">
+<td class="mono">{proto}</td><td class="mono">{port}</td><td>{name}</td><td class="mono">{bind}</td>
+<td class="mono">{first_seen}</td><td>{control}</td>
+</tr>"#,
+            row_class = if new { "row-new" } else { "" },
+            proto = socket.proto.as_str(),
+            port = socket.port,
+            name = esc(if name.is_empty() { "—" } else { name }),
+            bind = esc(&bind),
+            first_seen = esc(&first_seen),
+            control = control,
+        );
+    }
+    if rows.is_empty() {
+        let hint = if internal {
+            "No internal (loopback-only) services were discovered."
+        } else {
+            "No external listening services were discovered."
+        };
+        rows.push_str(&format!(
+            r#"<tr><td colspan="6" class="hint">{hint}</td></tr>"#
+        ));
+    }
+    let ack = if new_count > 0 {
+        format!(
+            r#"<form method="post" action="/firewall/services/ack" class="inline">{csrf}<button class="small ghost">Mark all services as seen</button></form>"#,
+            csrf = csrf_input(page)
+        )
+    } else {
+        String::new()
+    };
+    let (title, hint, extra) = if internal {
+        (
+            "Internal system services",
+            "Services bound only to loopback. They are marked internal, default to allow, and are protected by the loopback rule, so they cannot be dropped from this page.",
+            "Yellow rows are newly discovered and default to allow.",
+        )
+    } else {
+        (
+            "External system services",
+            "Services reachable beyond loopback. They default to allow; the toggle writes an explicit drop rule before established connections and the generated allow rules.",
+            "Yellow rows are newly discovered and default to allow.",
+        )
+    };
+    format!(
+        r#"<h2>{title}</h2>
+<p class="hint">{hint} {extra}</p>
+<div class="filters">{ack}</div>
+<div class="scroll"><table>
+<thead><tr><th>Protocol</th><th>Port</th><th>Service</th><th>Bind</th><th>First seen</th><th>Control</th></tr></thead>
+<tbody>{rows}</tbody></table></div>"#,
+        title = title,
+        hint = hint,
+        extra = extra,
+        ack = ack,
+        rows = rows,
+    )
+}
+
+fn honeypot_tab(
+    page: &Page<'_>,
+    cfg: &Config,
+    overrides: &BTreeMap<String, String>,
+    enabled: bool,
+    ports: &[u16],
+    hits: usize,
+) -> String {
+    let mut rows = String::new();
+    for port in ports {
+        let _ = write!(
+            rows,
+            r#"<tr><td class="mono">{port}</td>
+<td>
+<form method="post" action="/firewall/honeypot/port/edit" class="inline">
+{csrf}<input type="hidden" name="old" value="{port}">
+<input name="new" type="number" min="1" max="65535" value="{port}" class="short" required>
+<button class="small ghost">Save</button></form>
+</td>
+<td><form method="post" action="/firewall/honeypot/port/delete" class="inline" data-confirm="Remove honeypot port {port}?">
+{csrf}<input type="hidden" name="port" value="{port}">
+<button class="small danger">Delete</button></form></td></tr>"#,
+            port = port,
+            csrf = csrf_input(page),
+        );
+    }
+    if rows.is_empty() {
+        rows.push_str(
+            r#"<tr><td colspan="3" class="hint">No honeypot ports configured.</td></tr>"#,
+        );
+    }
+    let settings_form = params_form(
+        page,
+        "honeypot",
+        &["detection.honeypot_enabled", "detection.honeypot_hits"],
+        cfg,
+        overrides,
+        Some("firewall"),
+    );
+    format!(
+        r#"<h2>Honeypot</h2>
+<p>DET-26 watches ports that no real service uses. Contacts are detected from packet capture;
+the optional firewall adds these ports to its allow set so contacts reach the detector. There is
+still no listener, so clients get no service.</p>
+<p class="hint">Port changes adjust the firewall allow set immediately. The DET-26 packet engine
+still needs a RustIPS restart to watch newly added ports. Enabled: <strong>{enabled}</strong>,
+contacts before block: <strong>{hits}</strong>.</p>
+
+<h3>Honeypot ports</h3>
+<div class="scroll"><table><thead><tr><th>Port</th><th>Edit</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div>
+<form method="post" action="/firewall/honeypot/port/add" class="row-form">
+{csrf}<label>Add port <input name="port" type="number" min="1" max="65535" required class="short"></label>
+<button class="primary small">Add honeypot port</button>
+</form>
+
+<h3>Honeypot settings</h3>
+{settings_form}"#,
+        enabled = if enabled { "yes" } else { "no" },
+        hits = hits,
+        rows = rows,
+        csrf = csrf_input(page),
+        settings_form = settings_form,
+    )
+}
+
+fn firewall_settings_card(page: &Page<'_>, settings: &Firewall) -> String {
+    let tcp_value = settings
+        .allow_tcp_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let udp_value = settings
+        .allow_udp_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"<section class="panel firewall-settings">
+<h2>Firewall settings</h2>
+<p class="hint">These settings apply to the whole service firewall and take effect within a second.
+They are stored separately from the Active Drops, Admin Drops, System Services and Honeypot tabs.</p>
+<form method="post" action="/firewall/settings" class="params">
+{csrf}
+<div class="param-grid">
+<div class="param">
+<label class="check"><input type="hidden" name="discover_services" value="false">
+<input type="checkbox" name="discover_services" value="true"{discover_checked}>
+discover listening services</label>
+<div class="hint">Generate allow rules from TCP/UDP sockets found in /proc/net.</div>
+</div>
+<div class="param">
+<label for="firewall-refresh">Refresh (seconds)</label>
+<input id="firewall-refresh" name="refresh_secs" type="number" min="1" max="86400" value="{refresh}" required>
+<div class="hint">How often service discovery is repeated.</div>
+</div>
+<div class="param">
+<label for="firewall-tcp">Extra TCP ports</label>
+<input id="firewall-tcp" name="allow_tcp_ports" value="{tcp_value}" size="60" placeholder="22, 80, 443">
+<div class="hint">Comma-separated ports to allow even when nothing is listening yet.</div>
+</div>
+<div class="param">
+<label for="firewall-udp">Extra UDP ports</label>
+<input id="firewall-udp" name="allow_udp_ports" value="{udp_value}" size="60" placeholder="53, 123">
+<div class="hint">Comma-separated UDP ports to allow even when nothing is listening yet.</div>
+</div>
+<div class="param">
+<label class="check"><input type="hidden" name="include_honeypot" value="false">
+<input type="checkbox" name="include_honeypot" value="true"{honeypot_checked}>
+include enabled honeypot ports</label>
+<div class="hint">Required for DET-26 to see contacts when the firewall is on.</div>
+</div>
+<div class="param">
+<label class="check"><input type="hidden" name="log_drops" value="false">
+<input type="checkbox" name="log_drops" value="true"{log_checked}>
+log dropped packets to DET-27</label>
+<div class="hint">The firewall log is rate-limited to 10 packets/second with a burst of 20.</div>
+</div>
+<div class="param">
+<label class="check"><input type="hidden" name="reject" value="false">
+<input type="checkbox" name="reject" value="true"{reject_checked}>
+reject instead of drop</label>
+<div class="hint">Rejection is louder on the network; the packet is still logged to DET-27.</div>
+</div>
+</div>
+<div class="actions"><button class="primary small">Save firewall settings</button></div>
+</form>
+</section>"#,
+        csrf = csrf_input(page),
+        discover_checked = if settings.discover_services {
+            " checked"
+        } else {
+            ""
+        },
+        refresh = settings.refresh_secs,
+        tcp_value = esc(&tcp_value),
+        udp_value = esc(&udp_value),
+        honeypot_checked = if settings.include_honeypot {
+            " checked"
+        } else {
+            ""
+        },
+        log_checked = if settings.log_drops { " checked" } else { "" },
+        reject_checked = if settings.reject { " checked" } else { "" },
+    )
+}
+
+pub fn firewall(page: &Page<'_>, data: &FirewallView<'_>) -> String {
+    let flash = data
+        .notice
+        .map(|text| format!(r#"<p class="flash">{}</p>"#, esc(text)))
+        .unwrap_or_default();
+    let enabled = data.settings.enabled;
+    let state = format!(
+        r#"<form method="post" action="/firewall/toggle" class="inline">
+{csrf}<input type="hidden" name="enable" value="{next}">
+<button class="state-toggle {class}" title="{title}" aria-pressed="{pressed}">{label}</button>
+</form>"#,
+        csrf = csrf_input(page),
+        next = if enabled { "no" } else { "yes" },
+        class = if enabled { "state-on" } else { "state-off" },
+        title = if enabled {
+            "Click to disable the service firewall"
+        } else {
+            "Click to enable the service firewall"
+        },
+        pressed = enabled,
+        label = if enabled { "Enabled" } else { "Disabled" },
+    );
+
+    let mode_banner = if page.mode == Mode::Observe {
+        r#"<div class="banner warn"><strong>Observe mode.</strong> The service firewall is only written to nftables in enforce mode. The rules below show what would be applied.</div>"#
+    } else {
+        ""
+    };
+    let discovery_banner = data
+        .discovery_error
+        .map(|error| {
+            format!(
+                r#"<div class="banner danger"><strong>Service discovery failed.</strong> {}. The daemon keeps the last-good allow set rather than locking services out.</div>"#,
+                esc(error)
+            )
+        })
+        .unwrap_or_default();
+    let status_banner = if enabled {
+        format!(
+            r#"<div class="banner {class}"><strong>Service firewall is enabled.</strong> {allow} allow rule(s), {drops} explicit drop rule(s); the final rule {action} and logs to DET-27.</div>"#,
+            class = if page.mode == Mode::Observe {
+                "warn"
+            } else {
+                ""
+            },
+            allow = data.plan.allow_count(),
+            drops = data.plan.drop_count(),
+            action = if data.plan.reject { "rejects" } else { "drops" },
+        )
+    } else {
+        r#"<div class="banner"><strong>Service firewall is disabled.</strong> Only the always-on blocked-source rules are present; inbound traffic reaches your services normally.</div>"#.to_string()
+    };
+
+    let active_tab = match data.tab {
+        "permanent" => "permanent",
+        "admin" => "admin",
+        "external" | "services" => "external",
+        "internal" => "internal",
+        "honeypot" => "honeypot",
+        _ => "active",
+    };
+    let new_services = data
+        .listening
+        .iter()
+        .filter(|socket| {
+            service_state(data.service_states, socket).is_none_or(|state| !state.acknowledged)
+        })
+        .count();
+    let external_count = data
+        .listening
+        .iter()
+        .filter(|socket| !is_internal_service(socket))
+        .count();
+    let internal_count = data
+        .listening
+        .iter()
+        .filter(|socket| is_internal_service(socket))
+        .count();
+    let tabs = firewall_tabs(
+        active_tab,
+        data.active_blocks.len(),
+        data.permanent_blocks.len(),
+        data.admin_rules.len(),
+        external_count,
+        internal_count,
+        data.honeypot_ports.len(),
+    );
+    let tab_body = match active_tab {
+        "permanent" => active_drops_tab(page, data.permanent_blocks, data.geo, true),
+        "admin" => admin_drops_tab(page, data.admin_rules, data.edit_admin),
+        "external" => services_tab(page, data.listening, data.service_states, false),
+        "internal" => services_tab(page, data.listening, data.service_states, true),
+        "honeypot" => honeypot_tab(
+            page,
+            data.cfg,
+            data.detection_overrides,
+            data.honeypot_enabled,
+            data.honeypot_ports,
+            data.honeypot_hits,
+        ),
+        _ => active_drops_tab(page, data.active_blocks, data.geo, false),
+    };
+    let new_hint = if new_services > 0 && active_tab != "external" && active_tab != "internal" {
+        format!(
+            r#"<div class="banner warn"><strong>{new_services} new service(s)</strong> were discovered and default to allow. Review them on the External or Internal System Services tabs.</div>"#
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r#"<section class="panel">
+<h1>Firewall</h1>
+{flash}
+{status_banner}
+{mode_banner}
+{discovery_banner}
+{new_hint}
+<div class="row-form"><span>Service firewall</span>{state}</div>
+</section>
+
+<section class="panel firewall-tabs-panel">
+{tabs}
+<div class="tab-body">{tab_body}</div>
+</section>
+
+{settings_card}"#,
+        flash = flash,
+        status_banner = status_banner,
+        mode_banner = mode_banner,
+        discovery_banner = discovery_banner,
+        new_hint = new_hint,
+        state = state,
+        tabs = tabs,
+        tab_body = tab_body,
+        settings_card = firewall_settings_card(page, data.settings),
+    );
+    shell(page, "/firewall", "Firewall", &body)
+}
+
 // --------------------------------------------------------------------- alerts
 
 pub fn alerts(
@@ -2345,7 +3008,13 @@ least one webhook target below.</div>"#
 
 // -------------------------------------------------------------------- blocks
 
-pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>, geo: &GeoData) -> String {
+pub fn block_rows(
+    page: &Page<'_>,
+    rows: &[Block],
+    now: DateTime<Utc>,
+    geo: &GeoData,
+    tab: &str,
+) -> String {
     let mut out = String::new();
     for block in rows {
         let _ = write!(
@@ -2359,6 +3028,7 @@ pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>, geo: &Geo
 <td>{expiry}</td>
 <td><form method="post" action="/blocks/remove" class="inline" data-confirm="Unblock {src_text}?">
 {csrf}<input type="hidden" name="src" value="{src_raw}">
+<input type="hidden" name="tab" value="{tab}">
 <button class="small danger">Unblock</button></form></td>
 </tr>"#,
             src = ip_with_country(block.src, geo),
@@ -2373,47 +3043,10 @@ pub fn block_rows(page: &Page<'_>, rows: &[Block], now: DateTime<Utc>, geo: &Geo
             started = esc(&time(block.started_at)),
             expiry = esc(&remaining(block, now)),
             csrf = csrf_input(page),
+            tab = esc(tab),
         );
     }
     out
-}
-
-pub fn blocks(page: &Page<'_>, rows: &[Block], notice: Option<&str>, geo: &GeoData) -> String {
-    let flash = notice
-        .map(|n| format!(r#"<p class="flash">{}</p>"#, esc(n)))
-        .unwrap_or_default();
-    let body = format!(
-        r#"<section class="panel">
-<h1>Active blocks</h1>
-{flash}
-<p class="hint">Enforcement: {enforcement}. Blocks are owned by the daemon; expiry is applied from the database, never by a kernel timeout.</p>
-<div class="scroll"><table>
-<thead><tr><th>Source</th><th>Reason</th><th>Detector</th><th>Strike</th><th>Started (UTC)</th><th>Remaining</th><th></th></tr></thead>
-<tbody id="live-table">{rows}</tbody>
-</table></div>
-<p class="hint">This table refreshes every 2 seconds.</p>
-</section>
-<section class="panel">
-<h2>Manual block</h2>
-<form method="post" action="/blocks/add" class="row-form">
-{csrf}
-<label>Source <input name="src" placeholder="203.0.113.7" required class="mono"></label>
-<label>Minutes <input name="minutes" type="number" min="0" value="60" class="short"></label>
-<label>Reason <input name="reason" value="manual block" maxlength="200"></label>
-<button class="primary">Block</button>
-</form>
-<p class="hint">Zero minutes means permanent. Loopback, private and the host's own addresses cannot be blocked.</p>
-</section>"#,
-        flash = flash,
-        enforcement = if page.mode == Mode::Enforce {
-            "nftables"
-        } else {
-            "dry run (observe mode) — the block is recorded but not applied"
-        },
-        rows = block_rows(page, rows, Utc::now(), geo),
-        csrf = csrf_input(page)
-    );
-    shell(page, "/blocks", "Active blocks", &body)
 }
 
 pub fn history(page: &Page<'_>, rows: &[Block], geo: &GeoData) -> String {
@@ -2566,7 +3199,6 @@ pub fn settings(
     page: &Page<'_>,
     cfg: &Config,
     overrides: &[(String, serde_json::Value)],
-    detection_overrides: &BTreeMap<String, String>,
     country_colors: &CountryColors,
     country_default: &CountryColor,
     country_loaded: bool,
@@ -2712,15 +3344,13 @@ There is exactly one authority level: every authenticated administrator is a ful
 </div>
 </section>
 
-<section class="panel"><h2>Honeypot</h2>
-<p class="hint">DET-26 watches a list of TCP/UDP ports that no real service uses.
-A TCP SYN or UDP datagram to any listed port triggers an alert-only detection
-(the source is not blocked unless you add a Disposition rule for DET-26).
-Disabled by default. Changes apply after a RustIPS restart.</p>
-{honeypot_form}
-<p class="hint">Choose ports that are closed and not used by SSH, the web UI,
-or any real service. Do not list the RustIPS web port. See
-<a href="/detectors">Detectors</a> for the DET-26 catalog entry.</p>
+<section class="panel"><h2>Service firewall</h2>
+<p class="hint">The optional default-deny firewall is disabled by default. The
+<a href="/firewall">Firewall</a> page is tabbed: <strong>Active Drops</strong> (RustIPS blocks),
+<strong>Admin Drops</strong> (source/destination/protocol/port rules), <strong>System Services</strong>
+(discovered services, default allow, per-service drop toggle) and <strong>Honeypot</strong>
+(enabled, contacts threshold and port add/edit/delete). Discovery, pinned ports, drop logging
+and drop-vs-reject live in the separate Firewall settings card. DET-27 records final drops.</p>
 </section>
 
 <section class="panel"><h2>Country badge colors</h2>
@@ -2819,14 +3449,6 @@ Delivery is asynchronous and uses the system <span class="mono">curl</span>.</p>
         edit_foreground = esc(edit_foreground),
         edit_button = edit_button,
         cancel_edit = cancel_edit,
-        honeypot_form = params_form(
-            page,
-            "honeypot",
-            params::HONEYPOT,
-            cfg,
-            detection_overrides,
-            Some("settings"),
-        ),
         decay = cfg.ladder.strike_decay_days,
         effect = if cfg.ladder.unblock_effect == UnblockEffect::Reset {
             "reset strikes"

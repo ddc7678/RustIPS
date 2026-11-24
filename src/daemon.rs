@@ -24,6 +24,7 @@ use crate::decode;
 use crate::detect::Engine;
 use crate::enforce::{DryRunEnforcer, Enforcer, NftEnforcer};
 use crate::error::{Error, Result};
+use crate::firewall::{self, FirewallPlan, ListeningSocket};
 use crate::geo::GeoHandle;
 use crate::model::{Actor, BlockState, Detection};
 use crate::net::{self, Cidr};
@@ -749,9 +750,121 @@ fn scheduler_loop(
     let mut sampler = crate::system::Sampler::new();
     let mut last_sample = Instant::now();
     let mut first_sample = true;
+    let mut last_firewall_check = Instant::now() - Duration::from_secs(300);
+    let mut last_discovery = Instant::now() - Duration::from_secs(300);
+    let mut discovered: Vec<ListeningSocket> = Vec::new();
+    let mut discovery_ok = false;
+    let mut applied_firewall: Option<FirewallPlan> = None;
+    let mut firewall_retry_at = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(500));
+
+        // Optional service firewall. Settings are read every second so the UI
+        // toggle is live; listening services are re-discovered on the
+        // configured interval. A discovery failure never shrinks the previous
+        // allow set: the daemon keeps the last-good plan instead of locking the
+        // administrator out.
+        if last_firewall_check.elapsed() >= Duration::from_secs(1) {
+            last_firewall_check = Instant::now();
+            let settings = firewall::settings(&db, &cfg);
+            let refresh = Duration::from_secs(settings.refresh_secs.max(1));
+            let needs_discovery = settings.enabled
+                && settings.discover_services
+                && (last_discovery.elapsed() >= refresh || !discovery_ok);
+            if needs_discovery {
+                match firewall::discover() {
+                    Ok(sockets) => {
+                        let rows: Vec<(String, u16, Option<IpAddr>)> = sockets
+                            .iter()
+                            .map(|socket| {
+                                (socket.proto.as_str().to_string(), socket.port, socket.addr)
+                            })
+                            .collect();
+                        if let Err(e) = db.upsert_firewall_services(&rows, Utc::now()) {
+                            tracing::warn!(error = %e, "cannot record discovered services");
+                        }
+                        discovered = sockets;
+                        discovery_ok = true;
+                        last_discovery = Instant::now();
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "service discovery failed; keeping the previous firewall allow set"
+                        );
+                    }
+                }
+            } else if !settings.discover_services {
+                discovery_ok = true;
+            }
+
+            let discovery_required =
+                settings.enabled && settings.discover_services && !discovery_ok;
+            if discovery_required {
+                tracing::warn!(
+                    "service firewall is enabled but discovery has not succeeded; leaving the current chain unchanged"
+                );
+            } else {
+                // Honeypot port edits are stored as detection overrides. Use
+                // them for the firewall immediately even though DET-26 itself
+                // still needs a restart to watch the new ports.
+                let mut effective = cfg.clone();
+                if let Ok(overrides) = db.detection_overrides() {
+                    if !overrides.is_empty() {
+                        if let Err(e) = crate::params::apply_overrides(&mut effective, &overrides) {
+                            tracing::warn!(
+                                error = %e,
+                                "cannot apply detection overrides to the firewall plan"
+                            );
+                        }
+                    }
+                }
+                let admin = db.firewall_admin_rules().unwrap_or_default();
+                let services = db.firewall_services().unwrap_or_default();
+                let plan = firewall::plan(
+                    &settings,
+                    &effective.detection,
+                    &discovered,
+                    &admin,
+                    &services,
+                );
+                if applied_firewall.as_ref() != Some(&plan) && Instant::now() >= firewall_retry_at {
+                    match enforcer.apply_firewall(&plan) {
+                        Ok(()) => {
+                            let detail = if plan.enabled {
+                                format!(
+                                    "{} allow rule(s), log_drops={}, action={}",
+                                    plan.allow_count(),
+                                    plan.log_drops,
+                                    if plan.reject { "reject" } else { "drop" }
+                                )
+                            } else {
+                                "disabled; blocked-source rules remain".to_string()
+                            };
+                            let _ = db.audit(
+                                &Actor::System,
+                                if plan.enabled {
+                                    "firewall.apply"
+                                } else {
+                                    "firewall.disable"
+                                },
+                                "",
+                                &detail,
+                            );
+                            tracing::info!(enabled = plan.enabled, "{detail}");
+                            applied_firewall = Some(plan);
+                        }
+                        Err(e) => {
+                            // Retry on the same cadence as the drift check so a
+                            // broken nft setup cannot fill the log every second.
+                            firewall_retry_at = Instant::now() + Duration::from_secs(30);
+                            tracing::error!(error = %e, "cannot apply the service firewall");
+                        }
+                    }
+                }
+            }
+        }
 
         if first_sample || last_sample.elapsed() >= Duration::from_secs(30) {
             let sample = sampler.sample(&db_path);
@@ -892,6 +1005,7 @@ fn scheduler_loop(
                 Ok(_) => {}
                 Err(e) => tracing::error!("alert queue prune failed: {e}"),
             }
+            let _ = db.prune_firewall_services(Utc::now() - chrono::Duration::days(30));
             if let Err(e) = db.optimize() {
                 tracing::warn!("database optimisation skipped: {e}");
             }

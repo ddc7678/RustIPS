@@ -11,7 +11,7 @@ NAME="rustips-${VERSION}-linux-${ARCH}"
 cargo build --release --locked
 mkdir -p dist
 install -m 0755 target/release/rustips "dist/${NAME}"
-sha256sum "dist/${NAME}" > "dist/${NAME}.sha256"
+(cd dist && sha256sum "${NAME}" > "${NAME}.sha256")
 cp "docs/coverage/${VERSION}.json" "dist/${NAME}-scorecard.json" 2>/dev/null || true
 
 echo

@@ -12,6 +12,7 @@ pub mod decode;
 pub mod detect;
 pub mod enforce;
 pub mod error;
+pub mod firewall;
 pub mod geo;
 pub mod logs;
 pub mod model;

@@ -366,6 +366,172 @@ fn ui_login_breakglass_and_manual_block() {
             .unwrap()
     );
 
+    // Optional service firewall: disabled by default, same state toggle, and
+    // DET-27 plus both system-service and honeypot allow sources are visible.
+    let firewall = get(port, "/firewall", Some(&cookie));
+    assert_eq!(firewall.status, 200);
+    assert!(firewall.body.contains("Service firewall is disabled"));
+    assert!(firewall.body.contains("DET-27"));
+    assert!(firewall.body.contains("External System Services"));
+    assert!(firewall.body.contains("Internal System Services"));
+    assert!(firewall.body.contains("Active Drops"));
+    assert!(firewall.body.contains("Permanent Drops"));
+    assert!(firewall.body.contains("Admin Drops"));
+    assert!(firewall.body.contains("Honeypot"));
+    let admin_tab = get(port, "/firewall?tab=admin", Some(&cookie));
+    assert!(admin_tab.body.contains("Admin drops"));
+    let services_tab = get(port, "/firewall?tab=external", Some(&cookie));
+    assert!(services_tab.body.contains("External system services"));
+    let internal_tab = get(port, "/firewall?tab=internal", Some(&cookie));
+    assert!(internal_tab.body.contains("Internal system services"));
+    let honeypot_tab = get(port, "/firewall?tab=honeypot", Some(&cookie));
+    assert!(honeypot_tab.body.contains("Honeypot ports"));
+    assert!(firewall.body.contains("state-toggle"));
+    let firewall_on = post(
+        port,
+        "/firewall/toggle",
+        &format!("enable=yes&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(firewall_on.status, 303, "{}", firewall_on.headers);
+    let firewall_on_page = get(port, "/firewall", Some(&cookie));
+    assert!(
+        firewall_on_page
+            .body
+            .contains("Service firewall is enabled")
+    );
+    let firewall_off = post(
+        port,
+        "/firewall/toggle",
+        &format!("enable=no&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(firewall_off.status, 303);
+    assert!(
+        get(port, "/firewall", Some(&cookie))
+            .body
+            .contains("Service firewall is disabled")
+    );
+
+    // Admin drop CRUD and service drop toggles.
+    let admin_saved = post(
+        port,
+        "/firewall/admin/save",
+        &format!("id=0&src=203.0.113.0/24&dst=&proto=tcp&port=22&enabled=true&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(admin_saved.status, 303, "{}", admin_saved.headers);
+    assert!(
+        admin_saved
+            .headers
+            .contains("Location: /firewall?tab=admin")
+    );
+    let admin_rules = Db::open(&layout.db)
+        .unwrap()
+        .firewall_admin_rules()
+        .unwrap();
+    let admin_rule = admin_rules.first().expect("admin rule saved");
+    assert_eq!(admin_rule.src.as_deref(), Some("203.0.113.0/24"));
+    assert_eq!(admin_rule.proto, "tcp");
+    assert_eq!(admin_rule.port, Some(22));
+    let admin_edited = post(
+        port,
+        "/firewall/admin/save",
+        &format!(
+            "id={}&src=203.0.113.0/24&dst=192.0.2.10&proto=tcp&port=443&enabled=true&csrf={csrf_token}",
+            admin_rule.id
+        ),
+        Some(&cookie),
+    );
+    assert_eq!(admin_edited.status, 303);
+    let edited = Db::open(&layout.db)
+        .unwrap()
+        .firewall_admin_rule(admin_rule.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.dst.as_deref(), Some("192.0.2.10/32"));
+    assert_eq!(edited.port, Some(443));
+    let edit_page = get(
+        port,
+        &format!("/firewall?tab=admin&edit={}", admin_rule.id),
+        Some(&cookie),
+    );
+    assert!(edit_page.body.contains("value=\"192.0.2.10/32\""));
+    assert!(edit_page.body.contains("value=\"443\""));
+    let admin_disabled = post(
+        port,
+        "/firewall/admin/toggle",
+        &format!("id={}&enable=no&csrf={csrf_token}", admin_rule.id),
+        Some(&cookie),
+    );
+    assert_eq!(admin_disabled.status, 303);
+    assert!(
+        !Db::open(&layout.db)
+            .unwrap()
+            .firewall_admin_rule(admin_rule.id)
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    let admin_deleted = post(
+        port,
+        "/firewall/admin/delete",
+        &format!("id={}&csrf={csrf_token}", admin_rule.id),
+        Some(&cookie),
+    );
+    assert_eq!(admin_deleted.status, 303);
+    assert!(
+        Db::open(&layout.db)
+            .unwrap()
+            .firewall_admin_rule(admin_rule.id)
+            .unwrap()
+            .is_none()
+    );
+
+    // Viewing the services tab records discovered services; toggling one marks
+    // it dropped and acknowledged.
+    let services_page = get(port, "/firewall?tab=external", Some(&cookie));
+    assert_eq!(services_page.status, 200);
+    assert!(services_page.body.contains("External system services"));
+    let services = Db::open(&layout.db).unwrap().firewall_services().unwrap();
+    let service = services
+        .iter()
+        .find(|row| row.addr.is_none_or(|addr| !addr.is_loopback()))
+        .or_else(|| services.first())
+        .expect("at least one listening service");
+    let addr = service
+        .addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_default();
+    let service_dropped = post(
+        port,
+        "/firewall/services/toggle",
+        &format!(
+            "proto={}&port={}&addr={}&drop=yes&csrf={csrf_token}",
+            service.proto, service.port, addr
+        ),
+        Some(&cookie),
+    );
+    assert_eq!(service_dropped.status, 303);
+    let state = Db::open(&layout.db)
+        .unwrap()
+        .firewall_services()
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.proto == service.proto && row.port == service.port && row.addr == service.addr
+        })
+        .expect("service row");
+    assert!(state.dropped);
+    assert!(state.acknowledged);
+    let ack = post(
+        port,
+        "/firewall/services/ack",
+        &format!("csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(ack.status, 303);
+
     // Editable parameters and reset-to-default; internal detectors are gone.
     let params_page = get(port, "/detectors", Some(&cookie));
     assert_eq!(params_page.status, 200);
@@ -531,19 +697,18 @@ fn ui_login_breakglass_and_manual_block() {
             .is_empty()
     );
 
-    // Honeypot settings are edited on the Settings page and use the same
-    // validated override store.
-    let settings = get(port, "/settings", Some(&cookie));
+    // Honeypot settings and port CRUD live on the Firewall's Honeypot tab and
+    // use the same validated override store.
+    let settings = get(port, "/firewall?tab=honeypot", Some(&cookie));
     assert_eq!(settings.status, 200);
-    assert!(settings.body.contains("Honeypot"));
-    assert!(settings.body.contains("honeypot_ports"));
+    assert!(settings.body.contains("Honeypot ports"));
     assert!(settings.body.contains("p:detection.honeypot_enabled"));
     assert!(settings.body.contains("p:detection.honeypot_hits"));
     let honeypot_invalid = post(
         port,
         "/detectors/params",
         &format!(
-            "scope=honeypot&return=settings&action=save\
+            "scope=honeypot&return=firewall&action=save\
              &p:detection.honeypot_enabled=true&p:detection.honeypot_ports=&csrf={csrf_token}"
         ),
         Some(&cookie),
@@ -553,14 +718,18 @@ fn ui_login_breakglass_and_manual_block() {
         port,
         "/detectors/params",
         &format!(
-            "scope=honeypot&return=settings&action=save\
+            "scope=honeypot&return=firewall&action=save\
              &p:detection.honeypot_enabled=true&p:detection.honeypot_ports=2323,9999\
              &p:detection.honeypot_hits=4&csrf={csrf_token}"
         ),
         Some(&cookie),
     );
     assert_eq!(honeypot_saved.status, 303, "{}", honeypot_saved.headers);
-    assert!(honeypot_saved.headers.contains("Location: /settings"));
+    assert!(
+        honeypot_saved
+            .headers
+            .contains("Location: /firewall?tab=honeypot")
+    );
     let overrides = Db::open(&layout.db).unwrap().detection_overrides().unwrap();
     assert_eq!(
         overrides
@@ -578,14 +747,68 @@ fn ui_login_breakglass_and_manual_block() {
         overrides.get("detection.honeypot_hits").map(String::as_str),
         Some("4")
     );
+
+    // Honeypot port add/edit/delete rewrites the same validated override.
+    let port_added = post(
+        port,
+        "/firewall/honeypot/port/add",
+        &format!("port=4444&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(port_added.status, 303);
+    assert_eq!(
+        Db::open(&layout.db)
+            .unwrap()
+            .detection_overrides()
+            .unwrap()
+            .get("detection.honeypot_ports")
+            .map(String::as_str),
+        Some("2323, 4444, 9999")
+    );
+    let port_edited = post(
+        port,
+        "/firewall/honeypot/port/edit",
+        &format!("old=4444&new=5555&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(port_edited.status, 303);
+    assert_eq!(
+        Db::open(&layout.db)
+            .unwrap()
+            .detection_overrides()
+            .unwrap()
+            .get("detection.honeypot_ports")
+            .map(String::as_str),
+        Some("2323, 5555, 9999")
+    );
+    let port_deleted = post(
+        port,
+        "/firewall/honeypot/port/delete",
+        &format!("port=5555&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(port_deleted.status, 303);
+    assert_eq!(
+        Db::open(&layout.db)
+            .unwrap()
+            .detection_overrides()
+            .unwrap()
+            .get("detection.honeypot_ports")
+            .map(String::as_str),
+        Some("2323, 9999")
+    );
     let honeypot_reset = post(
         port,
         "/detectors/params",
-        &format!("scope=honeypot&return=settings&action=reset_scope&csrf={csrf_token}"),
+        &format!("scope=honeypot&return=firewall&action=reset_scope&csrf={csrf_token}"),
         Some(&cookie),
     );
     assert_eq!(honeypot_reset.status, 303);
-    assert!(honeypot_reset.headers.contains("Location: /settings"));
+    assert!(
+        honeypot_reset
+            .headers
+            .contains("Location: /firewall?tab=honeypot")
+    );
     assert!(
         Db::open(&layout.db)
             .unwrap()
@@ -597,7 +820,7 @@ fn ui_login_breakglass_and_manual_block() {
         port,
         "/detectors/params",
         &format!(
-            "scope=honeypot&return=settings&action=save\
+            "scope=honeypot&return=firewall&action=save\
              &p:detection.honeypot_enabled=false&p:detection.honeypot_ports=\
              &p:detection.honeypot_hits=3&csrf={csrf_token}"
         ),
@@ -920,8 +1143,12 @@ fn ui_login_breakglass_and_manual_block() {
         Some(&cookie),
     );
     assert_eq!(blocked.status, 303, "{}", blocked.headers);
-    assert!(blocked.headers.contains("Location: /blocks?notice=blocked"));
-    let blocks_page = get(port, "/blocks", Some(&cookie));
+    assert!(
+        blocked
+            .headers
+            .contains("Location: /firewall?tab=active&notice=blocked")
+    );
+    let blocks_page = get(port, "/firewall?tab=active", Some(&cookie));
     assert_eq!(blocks_page.status, 200);
     assert!(
         blocks_page
@@ -930,6 +1157,32 @@ fn ui_login_breakglass_and_manual_block() {
     );
     assert!(!blocks_page.body.contains("Unblock <button"));
     assert!(blocks_page.body.contains("data-ip=\"203.0.113.99\""));
+
+    // Temporary and permanent drops are separated into their own tabs.
+    let permanent = post(
+        port,
+        "/blocks/add",
+        &format!("src=203.0.113.100&minutes=0&reason=permanent-test&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(permanent.status, 303);
+    let active_tab = get(port, "/firewall?tab=active", Some(&cookie));
+    assert!(active_tab.body.contains("203.0.113.99"));
+    assert!(!active_tab.body.contains("203.0.113.100"));
+    let permanent_tab = get(port, "/firewall?tab=permanent", Some(&cookie));
+    assert!(permanent_tab.body.contains("203.0.113.100"));
+    assert!(!permanent_tab.body.contains("203.0.113.99"));
+    let partial = get(port, "/partial/blocks", Some(&cookie));
+    assert_eq!(partial.status, 200);
+    assert!(partial.body.contains("203.0.113.99"));
+    assert!(!partial.body.contains("203.0.113.100"));
+    let unblock_permanent = post(
+        port,
+        "/blocks/remove",
+        &format!("src=203.0.113.100&csrf={csrf_token}"),
+        Some(&cookie),
+    );
+    assert_eq!(unblock_permanent.status, 303);
 
     let db = Db::open(&layout.db).unwrap();
     let block = db

@@ -7,7 +7,7 @@ automated attacks, and blocks the source address at the firewall.
 **Project website:** <https://rustips.tech/> — product overview, screenshots and
 the design story.
 
-This repository currently contains **0.3.15**: the packet sensor, web UI,
+This repository currently contains **0.3.19**: the packet sensor, web UI,
 journald ingestion, rules platform, HTTP detectors, GeoIP/ASN enrichment,
 webhook alerting, slow-scan detection, the full-detector coverage gate, the
 distribution/first-run experience, a detector catalog with per-detector
@@ -18,7 +18,7 @@ permanent-block action, dashboard CPU/memory/database-storage graphs with a
 24-hour history dialog, and GeoIP country badges beside source addresses with
 an editable default color and comma-separated per-country overrides. The single
 binary installs itself with `setup --install-service`, captures traffic, runs
-detectors DET-01…17/20…26, parses HTTP access logs that reach the journal,
+detectors DET-01…17/20…27, parses HTTP access logs that reach the journal,
 stores evidence in SQLite, applies the configured rules and strike ladder,
 enforces blocks with nftables, and serves an embedded web UI on loopback with
 PAM authentication. Detector
@@ -27,17 +27,17 @@ File-only log sources and the optional eBPF/XDP capture path remain later work.
 
 ## Status
 
-| Area | 0.3.15 |
+| Area | 0.3.19 |
 |---|---|
 | Live capture (AF_PACKET) and pcap replay | yes |
-| Detectors | packet: DET-01…15, slow-scan DET-20 and honeypot DET-26 (block after 3); log: DET-16/17/21/23 |
+| Detectors | packet: DET-01…15, slow-scan DET-20 and honeypot DET-26 (block after 3); log: DET-16/17/21/23 and firewall DET-27 |
 | Host-log ingestion | journald via supervised `journalctl -f -o json`, cursor resume, bounded event store |
 | Disposition rules | data-driven rules with validation, revisions, dry-run, import/export, country/ASN conditions, disabled sample geo rules |
 | GeoIP / ASN | disposition-only compact range indexes, checksum-verified download, hot swap |
 | Alerts | generic JSON webhook with a persisted bounded queue, dedupe, retries/backoff and health/metrics |
 | Escalating blocks | yes (1h → 24h → 48h → 7d → permanent by default), per-rule ladder overrides |
-| Enforcement | nftables only, `input` hook, daemon-owned expiry |
-| Storage | SQLite (WAL), schema v10, daily detection aggregate, alert targets and queue, HTTP access fields, resource samples |
+| Enforcement | nftables only, `input` hook, daemon-owned expiry; optional default-deny service firewall |
+| Storage | SQLite (WAL), schema v12, daily detection aggregate, alert targets and queue, HTTP access fields, resource samples, firewall admin rules and service state |
 | Web UI | embedded, loopback by default, flash-free dark/light theme, collapsible blue-category left sidebar, single-button state toggles, live tables |
 | Authentication | PAM (`/etc/pam.d/rustips`) + `rustips-admin` group, break-glass token |
 | CLI | setup, check/config check, diagnose, run, status, block, unblock, allow, allowlist, detections, export, import, flush, auth test, auth breakglass, logs test, rules check/list/samples, geo update/status/lookup |
@@ -48,6 +48,7 @@ File-only log sources and the optional eBPF/XDP capture path remain later work.
 | Detector catalog | `/detectors` lists every detector with live thresholds/paths and a green/red single-button state toggle; changes persist in SQLite and apply immediately |
 | Detection parameters | every threshold and path/login list is editable in the UI; overrides are validated/stored in SQLite, reset per field/group/all, and apply at daemon start |
 | Honeypot | optional DET-26 watches configured unused TCP/UDP ports; disabled by default, fires after 3 contacts and blocks through the shipped disposition rule |
+| Service firewall | optional default-deny layer in `/firewall` tabs: Active Drops (expiring blocks), Permanent Drops, Admin Drops (source/destination/protocol/port rules), External System Services (default allow, yellow new rows, per-service drop toggle), Internal System Services (loopback-only) and Honeypot (enable/threshold plus port add/edit/delete). Generates allow rules from listening/pinned/honeypot ports, then logs drops to DET-27 and drops/rejects the rest |
 | IP history | every source address is clickable and opens a dialog with country (ISO), ASN, detections, blocks, strikes and related log events, plus a permanent-block button |
 | Country badges | when the GeoIP country index is loaded, source addresses show an ISO country tag; default is black with white text, with editable default and per-country colors in Settings |
 | Resource graphs | dashboard sparklines for process CPU %, RSS memory (MB) and database storage (MB); click for a 24-hour dialog |
@@ -61,9 +62,12 @@ rules, 0.3.2 GeoIP + HTTP detectors, 0.3.3 hardening/alerting, 0.3.4
 coverage gate, 0.3.5 distribution/first run, 0.3.6 release candidate, 0.3.7
 detector catalog/sidebar, 0.3.8 parameter editing, 0.3.9 navigation/theme/
 honeypot, 0.3.10 menu/state cleanup, 0.3.11 IP history, the 0.3.12
-Active-blocks fix, 0.3.13 resource graphs, the 0.3.14 disposition-rule layout fix
-and 0.3.15 country badges are done. The next step is the 1.0 soak/entry
-criteria. See `requirements.md` §14 for the full table.
+Active-blocks fix, 0.3.13 resource graphs, the 0.3.14 disposition-rule layout fix,
+0.3.15 country badges, the 0.3.16 optional service firewall, the 0.3.17
+tabbed firewall, the 0.3.18 Active/Permanent Drops split, external/internal
+service split and yellow new-service rows, and the 0.3.19 Active Drops refresh
+fix are done. The
+next step is the 1.0 soak/entry criteria. See `requirements.md` §14 for the full table.
 
 ## Requirements
 
@@ -256,7 +260,7 @@ Screenshots from the 0.3.14 release-candidate UI. Click an image for the full-si
 <table>
 <tr>
 <td width="33%" valign="top"><a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="RustIPS dashboard" width="100%"></a><br><sub><strong>Dashboard</strong> — traffic, detections, blocks and resource graphs.</sub></td>
-<td width="33%" valign="top"><a href="docs/screenshots/detectors.png"><img src="docs/screenshots/detectors.png" alt="RustIPS detector catalog" width="100%"></a><br><sub><strong>Detectors</strong> — 21 compiled detectors with live thresholds.</sub></td>
+<td width="33%" valign="top"><a href="docs/screenshots/detectors.png"><img src="docs/screenshots/detectors.png" alt="RustIPS detector catalog" width="100%"></a><br><sub><strong>Detectors</strong> — 22 compiled detectors with live thresholds.</sub></td>
 <td width="33%" valign="top"><a href="docs/screenshots/disposition-rules.png"><img src="docs/screenshots/disposition-rules.png" alt="RustIPS disposition rules" width="100%"></a><br><sub><strong>Disposition rules</strong> — alert, tag, allow, block or escalate.</sub></td>
 </tr>
 <tr>
@@ -553,8 +557,14 @@ tests in `src/logs/`; `docs/logs.md` shows how to exercise the real journal.
 * `docs/detectors.md` — detector vs disposition-rule layers, HTTP details,
   scope, parameter editing/reset, honeypot, enable/disable and the
   custom-detection answer.
+* `docs/firewall.md` — the optional service firewall: generated allow rules,
+  honeypot interaction, DET-27 logging, safety and recovery.
 * `docs/security-review.md` — 0.3.6 threat model, findings and accepted risks.
 * `docs/soak/0.3.6.md` — short-soak method and results.
+* `docs/iterations/0.3.19.md` — Active Drops refresh filtering fix.
+* `docs/iterations/0.3.18.md` — Active/Permanent Drops and external/internal service split.
+* `docs/iterations/0.3.17.md` — tabbed firewall, admin drops, service toggles and honeypot tab.
+* `docs/iterations/0.3.16.md` — optional service firewall and DET-27.
 * `docs/iterations/0.3.15.md` — GeoIP country badges and custom colors.
 * `docs/iterations/0.3.14.md` — disposition-rule table column sizing.
 * `docs/iterations/0.3.13.md` — dashboard resource graphs and 24-hour history.
@@ -566,7 +576,11 @@ tests in `src/logs/`; `docs/logs.md` shows how to exercise the real journal.
 * `docs/iterations/0.3.7.md` — detector catalog, toggles and sidebar.
 * `docs/iterations/0.3.6.md` — release-candidate validation and 1.0 decision.
 * `docs/iterations/0.3.5.md` — distribution, first-run tests and `diagnose`.
-* `docs/coverage/0.3.15.md` — the current TEST-37 scorecard.
+* `docs/coverage/0.3.19.md` — the current TEST-37 scorecard.
+* `docs/coverage/0.3.18.md` — the tab-split scorecard.
+* `docs/coverage/0.3.17.md` — the tabbed-firewall scorecard.
+* `docs/coverage/0.3.16.md` — the service-firewall scorecard.
+* `docs/coverage/0.3.15.md` — the country-badge scorecard.
 * `docs/coverage/0.3.14.md` — the rules-layout scorecard.
 * `docs/coverage/0.3.13.md` — the resource-graph scorecard.
 * `docs/coverage/0.3.12.md` — the Active-blocks fix scorecard.

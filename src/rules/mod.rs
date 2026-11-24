@@ -854,7 +854,7 @@ pub fn default_rule_documents() -> Vec<Rule> {
         .collect();
     let log_alert: Vec<String> = Detector::ALL
         .iter()
-        .filter(|det| det.is_log() && det.is_alert_only())
+        .filter(|det| det.is_log() && det.is_alert_only() && **det != Detector::FirewallDrop)
         .map(|det| det.as_str().to_string())
         .collect();
     let mut rules = vec![
@@ -941,6 +941,22 @@ pub fn default_rule_documents() -> Vec<Rule> {
                 ..RuleMatch::default()
             },
             action: RuleAction::Escalate { ladder: Vec::new() },
+        },
+        Rule {
+            id: 7,
+            name: "Firewall default-drop alert".into(),
+            description:
+                "DET-27: the optional service firewall dropped or rejected an inbound packet. Alert only; the packet is already denied."
+                    .into(),
+            enabled: true,
+            priority: 160,
+            severity: Severity::Warning,
+            dry_run: false,
+            when: RuleMatch {
+                detectors: vec!["DET-27".into()],
+                ..RuleMatch::default()
+            },
+            action: RuleAction::Alert,
         },
     ];
     rules.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));

@@ -11,7 +11,9 @@ use std::net::IpAddr;
 use chrono::{DateTime, Duration, Utc};
 
 use super::LogEvent;
-use super::parse::{T_HTTP_ACCESS, T_PAM_FAILURE, T_SSH_ACCEPTED, T_SSH_FAILED, T_SSH_INVALID};
+use super::parse::{
+    T_FIREWALL_DROP, T_HTTP_ACCESS, T_PAM_FAILURE, T_SSH_ACCEPTED, T_SSH_FAILED, T_SSH_INVALID,
+};
 use crate::config::LogDetection;
 use crate::model::{Detection, Detector, Proto};
 
@@ -21,6 +23,7 @@ pub struct LogEngine {
     pam_failures: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
     http_paths: HashMap<IpAddr, HashMap<String, DateTime<Utc>>>,
     http_status: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
+    firewall_drops: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
     /// Last SSH failure line keyed by source and user. The flag is true when
     /// the last line was `Invalid user`; OpenSSH can emit both `Invalid user`
     /// and `Failed password` for one attempt, so the following failure line is
@@ -41,6 +44,7 @@ impl LogEngine {
             pam_failures: HashMap::new(),
             http_paths: HashMap::new(),
             http_status: HashMap::new(),
+            firewall_drops: HashMap::new(),
             recent_ssh: HashMap::new(),
             cooldown: HashMap::new(),
         }
@@ -134,6 +138,22 @@ impl LogEngine {
                         {
                             out.push(self.make(Detector::PamFailureBurst, event, ip, n));
                         }
+                    }
+                }
+            }
+            T_FIREWALL_DROP => {
+                if let Some(ip) = event.src_ip {
+                    let n = window_push(
+                        &mut self.firewall_drops,
+                        ip,
+                        now,
+                        self.cfg.window_secs,
+                        self.cfg.max_tracked_sources,
+                    );
+                    // Rate-limited at the firewall, and cooldown-limited here so
+                    // a drop storm does not flood detections or webhooks.
+                    if self.ready(Detector::FirewallDrop, &ip.to_string(), now) {
+                        out.push(self.make(Detector::FirewallDrop, event, ip, n));
                     }
                 }
             }
@@ -437,6 +457,47 @@ mod tests {
                 "{template} still emits a retired detector"
             );
         }
+    }
+
+    #[test]
+    fn firewall_drops_fire_det27_once_per_cooldown() {
+        let cfg = LogDetection {
+            window_secs: 60,
+            cooldown_secs: 300,
+            ..LogDetection::default()
+        };
+        let mut engine = LogEngine::new(&cfg);
+        let ip: IpAddr = "203.0.113.70".parse().unwrap();
+        let start = Utc::now();
+        let mut found = Vec::new();
+        for i in 0..4 {
+            found.extend(engine.observe(&event(
+                T_FIREWALL_DROP,
+                Some(ip),
+                start + Duration::seconds(i),
+            )));
+        }
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].detector, Detector::FirewallDrop);
+        assert!(found[0].detector.is_alert_only());
+        assert_eq!(found[0].count, 1);
+        // A later drop inside the cooldown is silent; later still fires again.
+        assert!(
+            engine
+                .observe(&event(
+                    T_FIREWALL_DROP,
+                    Some(ip),
+                    start + Duration::seconds(30)
+                ))
+                .is_empty()
+        );
+        let later = engine.observe(&event(
+            T_FIREWALL_DROP,
+            Some(ip),
+            start + Duration::seconds(400),
+        ));
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].detector, Detector::FirewallDrop);
     }
 
     #[test]

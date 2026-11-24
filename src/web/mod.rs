@@ -33,6 +33,7 @@ use crate::daemon::Stats;
 use crate::db::Db;
 use crate::enforce::Enforcer;
 use crate::error::{Error, Result};
+use crate::firewall;
 use crate::geo::GeoHandle;
 use crate::model::{Actor as ModelActor, BlockState};
 use crate::net::{self, Cidr};
@@ -885,6 +886,7 @@ fn authenticated(ctx: &Ctx, request: &Request) -> Response {
         ("GET", "/detectors") => page_detectors(ctx, &view, request),
         ("GET", "/logs") => page_logs(ctx, &view, request),
         ("GET", "/blocks") => page_blocks(ctx, &view, request),
+        ("GET", "/firewall") => page_firewall(ctx, &view, request),
         ("GET", "/history") => page_history(ctx, &view),
         ("GET", "/strikes") => page_strikes(ctx, &view),
         ("GET", "/allowlist") => page_allowlist(ctx, &view, request),
@@ -909,6 +911,16 @@ fn authenticated(ctx: &Ctx, request: &Request) -> Response {
         ("POST", "/detectors/params") => do_detector_params(ctx, &view, request),
         ("POST", "/blocks/add") => do_block(ctx, &view, request),
         ("POST", "/blocks/remove") => do_unblock(ctx, &view, request),
+        ("POST", "/firewall/toggle") => do_firewall_toggle(ctx, &view, request),
+        ("POST", "/firewall/settings") => do_firewall_settings(ctx, &view, request),
+        ("POST", "/firewall/admin/save") => do_firewall_admin_save(ctx, &view, request),
+        ("POST", "/firewall/admin/delete") => do_firewall_admin_delete(ctx, &view, request),
+        ("POST", "/firewall/admin/toggle") => do_firewall_admin_toggle(ctx, &view, request),
+        ("POST", "/firewall/services/toggle") => do_firewall_service_toggle(ctx, &view, request),
+        ("POST", "/firewall/services/ack") => do_firewall_services_ack(ctx, &view),
+        ("POST", "/firewall/honeypot/port/add") => do_honeypot_port_add(ctx, &view, request),
+        ("POST", "/firewall/honeypot/port/edit") => do_honeypot_port_edit(ctx, &view, request),
+        ("POST", "/firewall/honeypot/port/delete") => do_honeypot_port_delete(ctx, &view, request),
         ("POST", "/allowlist/add") => do_allow_add(ctx, &view, request),
         ("POST", "/allowlist/remove") => do_allow_remove(ctx, &view, request),
         ("POST", "/rules/save") => do_rule_save(ctx, &view, request),
@@ -1633,10 +1645,20 @@ fn do_detector_params(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
     };
     let action = request.param("action").unwrap_or("save");
     let return_settings = request.param("return") == Some("settings");
+    let return_firewall = request.param("return") == Some("firewall");
     let back = if return_settings {
         "/settings"
+    } else if return_firewall {
+        "/firewall?tab=honeypot"
     } else {
         "/detectors"
+    };
+    let back_url = |notice: &str| {
+        if back.contains('?') {
+            format!("{back}&notice={notice}")
+        } else {
+            format!("{back}?notice={notice}")
+        }
     };
     let honeypot_form = request.param("scope") == Some("honeypot");
 
@@ -1651,7 +1673,7 @@ fn do_detector_params(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
             "all",
             "cleared every stored detection parameter override",
         );
-        return Response::redirect("/detectors?notice=params_reset_all");
+        return Response::redirect(&back_url("params_reset_all"));
     }
 
     if let Some(key) = request.param("reset_key") {
@@ -1683,7 +1705,7 @@ fn do_detector_params(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
         } else {
             "params_reset"
         };
-        return Response::redirect(&format!("{back}?notice={notice}"));
+        return Response::redirect(&back_url(notice));
     }
 
     let scope = request.param("scope").unwrap_or("");
@@ -1725,7 +1747,7 @@ fn do_detector_params(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
         } else {
             "params_reset_scope"
         };
-        return Response::redirect(&format!("{back}?notice={notice}"));
+        return Response::redirect(&back_url(notice));
     }
 
     let mut changes = std::collections::BTreeMap::new();
@@ -1780,7 +1802,607 @@ fn do_detector_params(ctx: &Ctx, view: &SessionView, request: &Request) -> Respo
     } else {
         "params_saved"
     };
-    Response::redirect(&format!("{back}?notice={notice}"))
+    Response::redirect(&back_url(notice))
+}
+
+// ------------------------------------------------------------------ firewall
+
+fn firewall_effective_config(ctx: &Ctx, db: &Db) -> std::result::Result<Config, String> {
+    let overrides = db.detection_overrides().map_err(|e| e.to_string())?;
+    let mut effective = ctx.baseline.clone();
+    crate::params::apply_overrides(&mut effective, &overrides)?;
+    Ok(effective)
+}
+
+fn page_firewall(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let tab = match request.param("tab").unwrap_or("active") {
+        "permanent" => "permanent",
+        "admin" => "admin",
+        "external" | "services" => "external",
+        "internal" => "internal",
+        "honeypot" => "honeypot",
+        _ => "active",
+    };
+    let settings = firewall::settings(&db, &ctx.cfg);
+    let (listening, discovery_error) = match firewall::discover() {
+        Ok(sockets) => {
+            let rows: Vec<(String, u16, Option<IpAddr>)> = sockets
+                .iter()
+                .map(|socket| (socket.proto.as_str().to_string(), socket.port, socket.addr))
+                .collect();
+            if let Err(e) = db.upsert_firewall_services(&rows, Utc::now()) {
+                tracing::warn!(error = %e, "cannot record discovered services");
+            }
+            (sockets, None)
+        }
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let service_states = db.firewall_services().unwrap_or_default();
+    let admin_rules = db.firewall_admin_rules().unwrap_or_default();
+    let all_blocks = db.list_active_blocks().unwrap_or_default();
+    let active_blocks: Vec<crate::model::Block> = all_blocks
+        .iter()
+        .filter(|block| !block.is_permanent())
+        .cloned()
+        .collect();
+    let permanent_blocks: Vec<crate::model::Block> = all_blocks
+        .into_iter()
+        .filter(|block| block.is_permanent())
+        .collect();
+    let overrides = db.detection_overrides().unwrap_or_default();
+    let effective = {
+        let mut cfg = ctx.baseline.clone();
+        let _ = crate::params::apply_overrides(&mut cfg, &overrides);
+        cfg
+    };
+    let plan = firewall::plan(
+        &settings,
+        &effective.detection,
+        &listening,
+        &admin_rules,
+        &service_states,
+    );
+    let edit_admin = request
+        .param("edit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|id| admin_rules.iter().find(|rule| rule.id == id));
+    let notice = request
+        .param("notice")
+        .and_then(notice_text)
+        .map(str::to_string);
+    let geo = geo_data(ctx);
+    let html = pages::firewall(
+        &page(ctx, view),
+        &pages::FirewallView {
+            tab,
+            settings: &settings,
+            plan: &plan,
+            listening: &listening,
+            service_states: &service_states,
+            admin_rules: &admin_rules,
+            edit_admin,
+            active_blocks: &active_blocks,
+            permanent_blocks: &permanent_blocks,
+            cfg: &effective,
+            detection_overrides: &overrides,
+            honeypot_enabled: effective.detection.honeypot_enabled,
+            honeypot_ports: &effective.detection.honeypot_ports,
+            honeypot_hits: effective.detection.honeypot_hits,
+            geo: &geo,
+            discovery_error: discovery_error.as_deref(),
+            notice: notice.as_deref(),
+        },
+    );
+    let html = if tab == "active" {
+        html.replacen(
+            "<body data-live=\"1\">",
+            "<body data-live=\"1\" data-partial=\"/partial/blocks\">",
+            1,
+        )
+    } else {
+        html
+    };
+    Response::html(html)
+}
+
+fn do_firewall_toggle(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut settings = firewall::settings(&db, &ctx.cfg);
+    let enable = request.param("enable") == Some("yes");
+    settings.enabled = enable;
+    if let Err(e) = firewall::save_settings(&db, &settings) {
+        return Response::error(500, "Firewall unchanged", &e.to_string());
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        if enable {
+            "firewall.enable"
+        } else {
+            "firewall.disable"
+        },
+        "service firewall",
+        if enable {
+            "service allow rules and default-deny enabled"
+        } else {
+            "service firewall disabled; blocked-source rules remain"
+        },
+    );
+    Response::redirect(if enable {
+        "/firewall?notice=firewall_enabled"
+    } else {
+        "/firewall?notice=firewall_disabled"
+    })
+}
+
+fn do_firewall_settings(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut settings = firewall::settings(&db, &ctx.cfg);
+    let refresh = match request
+        .param("refresh_secs")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(value) if (1..=86_400).contains(&value) => value,
+        _ => {
+            return Response::error(
+                400,
+                "Firewall settings rejected",
+                "Refresh must be 1..=86400 seconds.",
+            );
+        }
+    };
+    let allow_tcp = match parse_firewall_ports(request.param("allow_tcp_ports").unwrap_or("")) {
+        Ok(ports) => ports,
+        Err(e) => return Response::error(400, "Firewall settings rejected", &e),
+    };
+    let allow_udp = match parse_firewall_ports(request.param("allow_udp_ports").unwrap_or("")) {
+        Ok(ports) => ports,
+        Err(e) => return Response::error(400, "Firewall settings rejected", &e),
+    };
+
+    settings.discover_services = form_bool(request, "discover_services");
+    settings.refresh_secs = refresh;
+    settings.allow_tcp_ports = allow_tcp;
+    settings.allow_udp_ports = allow_udp;
+    settings.include_honeypot = form_bool(request, "include_honeypot");
+    settings.log_drops = form_bool(request, "log_drops");
+    settings.reject = form_bool(request, "reject");
+    if let Err(e) = firewall::save_settings(&db, &settings) {
+        return Response::error(500, "Firewall unchanged", &e.to_string());
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "firewall.settings",
+        "service firewall",
+        &format!(
+            "discover={} refresh={}s tcp={:?} udp={:?} honeypot={} log_drops={} reject={}",
+            settings.discover_services,
+            settings.refresh_secs,
+            settings.allow_tcp_ports,
+            settings.allow_udp_ports,
+            settings.include_honeypot,
+            settings.log_drops,
+            settings.reject
+        ),
+    );
+    Response::redirect("/firewall?notice=firewall_saved")
+}
+
+fn form_bool(request: &Request, name: &str) -> bool {
+    request.param(name).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        )
+    })
+}
+
+fn parse_firewall_ports(raw: &str) -> std::result::Result<Vec<u16>, String> {
+    let mut ports = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let port: u16 = item
+            .parse()
+            .map_err(|_| format!("{item:?} is not a port (1..=65535)"))?;
+        if port == 0 {
+            return Err("ports must be 1..=65535".into());
+        }
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    ports.sort_unstable();
+    Ok(ports)
+}
+
+fn parse_optional_cidr(value: &str) -> std::result::Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Cidr::parse(value)
+        .map(|cidr| Some(cidr.to_string()))
+        .map_err(|e| format!("{value:?}: {e}"))
+}
+
+fn do_firewall_admin_save(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let id = match request.param("id").unwrap_or("0").trim().parse::<i64>() {
+        Ok(id) if id >= 0 => id,
+        _ => return Response::error(400, "Admin drop rejected", "Invalid rule ID."),
+    };
+    let src = match parse_optional_cidr(request.param("src").unwrap_or("")) {
+        Ok(src) => src,
+        Err(e) => return Response::error(400, "Admin drop rejected", &e),
+    };
+    let dst = match parse_optional_cidr(request.param("dst").unwrap_or("")) {
+        Ok(dst) => dst,
+        Err(e) => return Response::error(400, "Admin drop rejected", &e),
+    };
+    if let (Some(src), Some(dst)) = (&src, &dst) {
+        let src = Cidr::parse(src).ok();
+        let dst = Cidr::parse(dst).ok();
+        if let (Some(src), Some(dst)) = (src, dst)
+            && src.addr.is_ipv4() != dst.addr.is_ipv4()
+        {
+            return Response::error(
+                400,
+                "Admin drop rejected",
+                "Source and destination must be the same address family.",
+            );
+        }
+    }
+    let proto = match request
+        .param("proto")
+        .unwrap_or("any")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "any" | "" => "any",
+        "tcp" => "tcp",
+        "udp" => "udp",
+        "icmp" => "icmp",
+        "icmp6" | "icmpv6" => "icmp6",
+        _ => {
+            return Response::error(
+                400,
+                "Admin drop rejected",
+                "Protocol must be any, tcp, udp, icmp or icmp6.",
+            );
+        }
+    };
+    let port = match request.param("port").unwrap_or("").trim() {
+        "" => None,
+        value => match value.parse::<u16>() {
+            Ok(port) if port > 0 => Some(port),
+            _ => {
+                return Response::error(
+                    400,
+                    "Admin drop rejected",
+                    "Port must be 1..=65535 or blank.",
+                );
+            }
+        },
+    };
+    if port.is_some() && !matches!(proto, "tcp" | "udp") {
+        return Response::error(
+            400,
+            "Admin drop rejected",
+            "A port can only be used with TCP or UDP.",
+        );
+    }
+    let enabled = form_bool(request, "enabled");
+    let saved = match db.save_firewall_admin_rule(
+        id,
+        src.as_deref(),
+        dst.as_deref(),
+        proto,
+        port,
+        enabled,
+        &view.user,
+    ) {
+        Ok(saved) => saved,
+        Err(e) => return Response::error(500, "Admin drop unchanged", &e.to_string()),
+    };
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        if id == 0 {
+            "firewall.admin.create"
+        } else {
+            "firewall.admin.update"
+        },
+        &saved.to_string(),
+        &format!(
+            "src={} dst={} proto={} port={} enabled={}",
+            src.as_deref().unwrap_or("any"),
+            dst.as_deref().unwrap_or("any"),
+            proto,
+            port.map(|port| port.to_string())
+                .unwrap_or_else(|| "any".into()),
+            enabled
+        ),
+    );
+    Response::redirect("/firewall?tab=admin&notice=admin_rule_saved")
+}
+
+fn do_firewall_admin_delete(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(id) = request
+        .param("id")
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Response::redirect("/firewall?tab=admin&notice=admin_rule_missing");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    match db.delete_firewall_admin_rule(id) {
+        Ok(true) => {
+            audit(
+                ctx,
+                &ModelActor::Admin(view.user.clone()),
+                "firewall.admin.delete",
+                &id.to_string(),
+                "admin drop rule deleted",
+            );
+            Response::redirect("/firewall?tab=admin&notice=admin_rule_deleted")
+        }
+        Ok(false) => Response::redirect("/firewall?tab=admin&notice=admin_rule_missing"),
+        Err(e) => Response::error(500, "Admin drop unchanged", &e.to_string()),
+    }
+}
+
+fn do_firewall_admin_toggle(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(id) = request
+        .param("id")
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Response::redirect("/firewall?tab=admin&notice=admin_rule_missing");
+    };
+    let enable = request.param("enable") == Some("yes");
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    match db.set_firewall_admin_rule_enabled(id, enable, &view.user) {
+        Ok(true) => {
+            audit(
+                ctx,
+                &ModelActor::Admin(view.user.clone()),
+                if enable {
+                    "firewall.admin.enable"
+                } else {
+                    "firewall.admin.disable"
+                },
+                &id.to_string(),
+                "admin drop rule state changed",
+            );
+            Response::redirect(if enable {
+                "/firewall?tab=admin&notice=admin_rule_enabled"
+            } else {
+                "/firewall?tab=admin&notice=admin_rule_disabled"
+            })
+        }
+        Ok(false) => Response::redirect("/firewall?tab=admin&notice=admin_rule_missing"),
+        Err(e) => Response::error(500, "Admin drop unchanged", &e.to_string()),
+    }
+}
+
+fn do_firewall_service_toggle(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let proto = match request.param("proto").unwrap_or("") {
+        "tcp" => "tcp",
+        "udp" => "udp",
+        _ => return Response::redirect("/firewall?tab=services&notice=service_missing"),
+    };
+    let Some(port) = request
+        .param("port")
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return Response::redirect("/firewall?tab=services&notice=service_missing");
+    };
+    let addr = request
+        .param("addr")
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    let drop = request.param("drop") == Some("yes");
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    match db.set_firewall_service_dropped(proto, port, addr, drop) {
+        Ok(true) => {
+            audit(
+                ctx,
+                &ModelActor::Admin(view.user.clone()),
+                if drop {
+                    "firewall.service.drop"
+                } else {
+                    "firewall.service.allow"
+                },
+                &format!("{proto}/{port}"),
+                &format!(
+                    "addr={} dropped={drop}",
+                    addr.map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "any".into())
+                ),
+            );
+            Response::redirect(if drop {
+                "/firewall?tab=services&notice=service_dropped"
+            } else {
+                "/firewall?tab=services&notice=service_allowed"
+            })
+        }
+        Ok(false) => Response::redirect("/firewall?tab=services&notice=service_missing"),
+        Err(e) => Response::error(500, "Service unchanged", &e.to_string()),
+    }
+}
+
+fn do_firewall_services_ack(ctx: &Ctx, view: &SessionView) -> Response {
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    match db.acknowledge_firewall_services() {
+        Ok(count) => {
+            audit(
+                ctx,
+                &ModelActor::Admin(view.user.clone()),
+                "firewall.services.ack",
+                "",
+                &format!("{count} service row(s) marked as seen"),
+            );
+            Response::redirect("/firewall?tab=services&notice=services_acknowledged")
+        }
+        Err(e) => Response::error(500, "Services unchanged", &e.to_string()),
+    }
+}
+
+fn save_honeypot_ports(ctx: &Ctx, db: &Db, ports: &[u16]) -> std::result::Result<(), String> {
+    let key = "detection.honeypot_ports";
+    let spec = crate::params::spec(key).ok_or_else(|| "unknown parameter".to_string())?;
+    let raw = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let normalized = crate::params::normalize(spec, &raw)?;
+    let mut overrides = db.detection_overrides().map_err(|e| e.to_string())?;
+    overrides.insert(key.to_string(), normalized.clone());
+    let mut candidate = ctx.baseline.clone();
+    crate::params::apply_overrides(&mut candidate, &overrides)?;
+    let mut changes = std::collections::BTreeMap::new();
+    changes.insert(key.to_string(), normalized);
+    db.set_detection_overrides(&changes, &[])
+        .map_err(|e| e.to_string())
+}
+
+fn do_honeypot_port_add(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(port) = request
+        .param("port")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+    else {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut ports = match firewall_effective_config(ctx, &db) {
+        Ok(cfg) => cfg.detection.honeypot_ports,
+        Err(e) => return Response::error(500, "Honeypot unchanged", &e),
+    };
+    if ports.contains(&port) {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_duplicate");
+    }
+    ports.push(port);
+    ports.sort_unstable();
+    if let Err(e) = save_honeypot_ports(ctx, &db, &ports) {
+        return Response::error(400, "Honeypot unchanged", &e);
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "firewall.honeypot.port.add",
+        &port.to_string(),
+        "honeypot port added; DET-26 restart required, firewall allow set updates live",
+    );
+    Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_saved")
+}
+
+fn do_honeypot_port_delete(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let Some(port) = request
+        .param("port")
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut ports = match firewall_effective_config(ctx, &db) {
+        Ok(cfg) => cfg.detection.honeypot_ports,
+        Err(e) => return Response::error(500, "Honeypot unchanged", &e),
+    };
+    if !ports.contains(&port) {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_missing");
+    }
+    ports.retain(|existing| *existing != port);
+    if let Err(e) = save_honeypot_ports(ctx, &db, &ports) {
+        return Response::error(400, "Honeypot unchanged", &e);
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "firewall.honeypot.port.delete",
+        &port.to_string(),
+        "honeypot port removed; DET-26 restart required, firewall allow set updates live",
+    );
+    Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_saved")
+}
+
+fn do_honeypot_port_edit(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let old = request
+        .param("old")
+        .and_then(|value| value.parse::<u16>().ok());
+    let new = request
+        .param("new")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0);
+    let (Some(old), Some(new)) = (old, new) else {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_invalid");
+    };
+    let db = match open_db(ctx) {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let mut ports = match firewall_effective_config(ctx, &db) {
+        Ok(cfg) => cfg.detection.honeypot_ports,
+        Err(e) => return Response::error(500, "Honeypot unchanged", &e),
+    };
+    if !ports.contains(&old) {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_missing");
+    }
+    if old != new && ports.contains(&new) {
+        return Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_duplicate");
+    }
+    for port in &mut ports {
+        if *port == old {
+            *port = new;
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    if let Err(e) = save_honeypot_ports(ctx, &db, &ports) {
+        return Response::error(400, "Honeypot unchanged", &e);
+    }
+    audit(
+        ctx,
+        &ModelActor::Admin(view.user.clone()),
+        "firewall.honeypot.port.edit",
+        &new.to_string(),
+        &format!("honeypot port {old} changed to {new}; DET-26 restart required"),
+    );
+    Response::redirect("/firewall?tab=honeypot&notice=honeypot_port_saved")
 }
 
 // ---------------------------------------------------------------------- logs
@@ -2563,24 +3185,9 @@ fn do_alert_test(ctx: &Ctx, view: &SessionView) -> Response {
 
 // ---------------------------------------------------------------------- blocks
 
-fn page_blocks(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
-    let db = match open_db(ctx) {
-        Ok(db) => db,
-        Err(response) => return response,
-    };
-    let rows = db.list_active_blocks().unwrap_or_default();
-    let notice = request
-        .param("notice")
-        .and_then(notice_text)
-        .map(str::to_string);
-    let geo = geo_data(ctx);
-    let body = pages::blocks(&page(ctx, view), &rows, notice.as_deref(), &geo);
-    let body = body.replacen(
-        "<body data-live=\"1\">",
-        "<body data-live=\"1\" data-partial=\"/partial/blocks\">",
-        1,
-    );
-    Response::html(body)
+fn page_blocks(_ctx: &Ctx, _view: &SessionView, _request: &Request) -> Response {
+    // Active blocks now live in the Firewall's Active Drops tab.
+    Response::redirect("/firewall?tab=active")
 }
 
 fn partial_blocks(ctx: &Ctx, view: &SessionView) -> Response {
@@ -2588,9 +3195,22 @@ fn partial_blocks(ctx: &Ctx, view: &SessionView) -> Response {
         Ok(db) => db,
         Err(response) => return response,
     };
-    let rows = db.list_active_blocks().unwrap_or_default();
+    // The Active Drops tab only shows expiring blocks. Permanent blocks have
+    // their own tab and must not leak into the live refresh fragment.
+    let rows: Vec<crate::model::Block> = db
+        .list_active_blocks()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|block| !block.is_permanent())
+        .collect();
     let geo = geo_data(ctx);
-    Response::html(pages::block_rows(&page(ctx, view), &rows, Utc::now(), &geo))
+    Response::html(pages::block_rows(
+        &page(ctx, view),
+        &rows,
+        Utc::now(),
+        &geo,
+        "active",
+    ))
 }
 
 fn page_history(ctx: &Ctx, view: &SessionView) -> Response {
@@ -2698,7 +3318,6 @@ fn page_settings(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         Err(response) => return response,
     };
     let overrides = db.list_settings().unwrap_or_default();
-    let detection_overrides = db.detection_overrides().unwrap_or_default();
     let country_colors = countries::load(&db);
     let country_default = countries::load_default(&db);
     let country_loaded = geo_data(ctx).country.is_some();
@@ -2741,7 +3360,6 @@ fn page_settings(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         &page(ctx, view),
         &ctx.cfg,
         &overrides,
-        &detection_overrides,
         &country_colors,
         &country_default,
         country_loaded,
@@ -2947,10 +3565,10 @@ fn do_block(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
     let raw = request.param("src").unwrap_or("").trim();
     let ip = match raw.parse::<IpAddr>() {
         Ok(ip) => net::normalise(ip),
-        Err(_) => return Response::redirect("/blocks?notice=invalid_ip"),
+        Err(_) => return Response::redirect("/firewall?tab=active&notice=invalid_ip"),
     };
     if net::is_implicitly_allowed(ip) {
-        return Response::redirect("/blocks?notice=implicit");
+        return Response::redirect("/firewall?tab=active&notice=implicit");
     }
     let duration = match request.param("minutes").unwrap_or("60").trim() {
         "" | "0" | "permanent" | "forever" => BlockDuration::Permanent,
@@ -2958,9 +3576,10 @@ fn do_block(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
             Ok(minutes) if (1..=5_256_000).contains(&minutes) => {
                 BlockDuration::Temporary(minutes * 60)
             }
-            _ => return Response::redirect("/blocks?notice=invalid_duration"),
+            _ => return Response::redirect("/firewall?tab=active&notice=invalid_duration"),
         },
     };
+    let permanent = matches!(duration, BlockDuration::Permanent);
     let reason = sanitize_reason(request.param("reason").unwrap_or("manual block"));
 
     let db = match open_db(ctx) {
@@ -2970,7 +3589,7 @@ fn do_block(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
     if let Ok(allow) = db.allowlist_matcher()
         && allow.iter().any(|cidr| cidr.contains(ip))
     {
-        return Response::redirect("/blocks?notice=allowlisted");
+        return Response::redirect("/firewall?tab=active&notice=allowlisted");
     }
     let strike = db.strike_count(ip).unwrap_or(0);
     let block = match db.upsert_block(ip, duration, strike, &reason, None, None, Utc::now()) {
@@ -3002,21 +3621,31 @@ fn do_block(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         &detail,
     );
     tracing::warn!(actor = %view.user, ip = %ip, %duration, "manual block");
-    Response::redirect("/blocks?notice=blocked")
+    Response::redirect(if permanent {
+        "/firewall?tab=permanent&notice=blocked"
+    } else {
+        "/firewall?tab=active&notice=blocked"
+    })
 }
 
 fn do_unblock(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
+    let tab = if request.param("tab") == Some("permanent") {
+        "permanent"
+    } else {
+        "active"
+    };
+    let back = |notice: &str| format!("/firewall?tab={tab}&notice={notice}");
     let raw = request.param("src").unwrap_or("").trim();
     let ip = match raw.parse::<IpAddr>() {
         Ok(ip) => net::normalise(ip),
-        Err(_) => return Response::redirect("/blocks?notice=invalid_ip"),
+        Err(_) => return Response::redirect(&back("invalid_ip")),
     };
     let db = match open_db(ctx) {
         Ok(db) => db,
         Err(response) => return response,
     };
     let Some(block) = db.active_block(ip).unwrap_or(None) else {
-        return Response::redirect("/blocks?notice=not_blocked");
+        return Response::redirect(&back("not_blocked"));
     };
     if ctx.cfg.mode == Mode::Enforce
         && let Err(e) = ctx.enforcer.remove(ip)
@@ -3029,7 +3658,7 @@ fn do_unblock(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
             &ip.to_string(),
             &format!("kernel removal failed: {e}"),
         );
-        return Response::redirect("/blocks?notice=unblock_failed");
+        return Response::redirect(&back("unblock_failed"));
     }
     let result = db
         .mark_block_state(block.id, BlockState::ManualUnblocked)
@@ -3056,7 +3685,7 @@ fn do_unblock(ctx: &Ctx, view: &SessionView, request: &Request) -> Response {
         "manual unblock from the UI",
     );
     tracing::warn!(actor = %view.user, ip = %ip, "manual unblock");
-    Response::redirect("/blocks?notice=unblocked")
+    Response::redirect(&back("unblocked"))
 }
 
 // --------------------------------------------------------------------- audit
@@ -3146,6 +3775,28 @@ fn notice_text(code: &str) -> Option<&'static str> {
         }
         "honeypot_saved" => Some("Honeypot settings saved. Restart RustIPS to apply them."),
         "honeypot_reset" => Some("Honeypot setting reset. Restart RustIPS to apply."),
+        "firewall_enabled" => Some(
+            "Service firewall enabled. Allow rules apply within a second; DET-27 records drops.",
+        ),
+        "firewall_disabled" => {
+            Some("Service firewall disabled. Blocked-source rules remain in force.")
+        }
+        "firewall_saved" => Some("Firewall settings saved and apply within a second."),
+        "admin_rule_saved" => Some("Admin drop rule saved."),
+        "admin_rule_deleted" => Some("Admin drop rule deleted."),
+        "admin_rule_enabled" => Some("Admin drop rule enabled."),
+        "admin_rule_disabled" => Some("Admin drop rule disabled."),
+        "admin_rule_missing" => Some("That admin drop rule no longer exists."),
+        "service_dropped" => Some("Service is now dropped by the firewall."),
+        "service_allowed" => Some("Service is allowed again."),
+        "service_missing" => Some("That service is no longer discovered."),
+        "services_acknowledged" => Some("New services marked as seen."),
+        "honeypot_port_saved" => Some(
+            "Honeypot ports saved. The firewall allow set updates live; restart RustIPS for DET-26 to watch new ports.",
+        ),
+        "honeypot_port_invalid" => Some("Honeypot port must be 1..=65535."),
+        "honeypot_port_duplicate" => Some("That honeypot port is already configured."),
+        "honeypot_port_missing" => Some("That honeypot port is not configured."),
         "rules_imported" => Some("Rule set imported and validated."),
         "geo_check_requested" => {
             Some("Geo update requested; it runs in the background within a few seconds.")

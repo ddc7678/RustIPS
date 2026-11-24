@@ -76,6 +76,8 @@ pub enum Detector {
     AccountModification,
     #[serde(rename = "DET-26")]
     Honeypot,
+    #[serde(rename = "DET-27")]
+    FirewallDrop,
 }
 
 impl Detector {
@@ -105,6 +107,7 @@ impl Detector {
             Detector::SystemSecurityChange => "DET-24",
             Detector::AccountModification => "DET-25",
             Detector::Honeypot => "DET-26",
+            Detector::FirewallDrop => "DET-27",
         }
     }
 
@@ -153,6 +156,7 @@ impl Detector {
             Detector::SystemSecurityChange => "Security-relevant system change",
             Detector::AccountModification => "Account or privilege modification",
             Detector::Honeypot => "Honeypot port contact",
+            Detector::FirewallDrop => "Firewall default-drop",
         }
     }
 
@@ -169,7 +173,8 @@ impl Detector {
             | Detector::SudoDenial
             | Detector::HttpLogScan
             | Detector::SystemSecurityChange
-            | Detector::AccountModification => DetectorCategory::Log,
+            | Detector::AccountModification
+            | Detector::FirewallDrop => DetectorCategory::Log,
             _ => DetectorCategory::Packet,
         }
     }
@@ -250,6 +255,9 @@ impl Detector {
             Detector::Honeypot => {
                 "Honeypot port contact: a TCP SYN or UDP datagram from another host to any port listed in detection.honeypot_ports. Three contacts in the detection window trigger DET-26; the shipped disposition rule blocks after that threshold. The honeypot is disabled by default."
             }
+            Detector::FirewallDrop => {
+                "Firewall default-drop: an inbound packet reached the final rule of the optional service firewall and was dropped or rejected. Fed by the nftables kernel log prefix, rate-limited at the firewall and cooldown-limited per source. Alert only by default; the packet is already denied."
+            }
         }
     }
 
@@ -262,6 +270,7 @@ impl Detector {
                 | Detector::SlowScan
                 | Detector::SystemSecurityChange
                 | Detector::AccountModification
+                | Detector::FirewallDrop
         )
     }
 
@@ -276,10 +285,11 @@ impl Detector {
                 | Detector::HttpLogScan
                 | Detector::SystemSecurityChange
                 | Detector::AccountModification
+                | Detector::FirewallDrop
         )
     }
 
-    pub const ALL: [Detector; 21] = [
+    pub const ALL: [Detector; 22] = [
         Detector::VerticalScan,
         Detector::HorizontalScan,
         Detector::StealthScan,
@@ -301,6 +311,7 @@ impl Detector {
         Detector::PamFailureBurst,
         Detector::HttpLogScan,
         Detector::Honeypot,
+        Detector::FirewallDrop,
     ];
 }
 
@@ -481,7 +492,7 @@ mod tests {
         assert_eq!(Detector::SshAuthFailures.to_string(), "DET-16");
         assert_eq!(Detector::SlowScan.to_string(), "DET-20");
         assert_eq!(Detector::AccountModification.to_string(), "DET-25");
-        assert_eq!(Detector::ALL.len(), 21);
+        assert_eq!(Detector::ALL.len(), 22);
         assert!(Detector::SshSuccessAfterFailures.is_alert_only());
         assert!(Detector::SshAuthFailures.is_log());
         assert!(!Detector::VerticalScan.is_log());

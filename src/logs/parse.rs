@@ -26,6 +26,7 @@ pub const T_CRON: &str = "cron.job";
 pub const T_SECURITY_CHANGE: &str = "system.security_change";
 pub const T_ACCOUNT_CHANGE: &str = "account.modification";
 pub const T_HTTP_ACCESS: &str = "http.access";
+pub const T_FIREWALL_DROP: &str = "firewall.drop";
 pub const T_GENERIC: &str = "generic";
 
 /// A decoded `journalctl -o json` record before parser classification.
@@ -164,6 +165,11 @@ fn classify(record: &JournalRecord) -> Fields {
     let identifier = record.identifier.as_deref().unwrap_or("");
     let id = identifier.to_ascii_lowercase();
 
+    // DET-27: the optional firewall's final rule logs with a stable prefix.
+    if let Some(firewall) = parse_firewall_drop(message) {
+        return firewall;
+    }
+
     if let Some(http) = parse_access_log(message) {
         return http;
     }
@@ -254,6 +260,23 @@ fn classify(record: &JournalRecord) -> Fields {
         outcome: Some("observed".into()),
         ..Fields::default()
     }
+}
+
+/// nftables kernel log line produced by the optional firewall:
+/// `rustips-fw-drop IN=eth0 ... SRC=203.0.113.5 DST=192.0.2.1 ... PROTO=TCP DPT=23`.
+fn parse_firewall_drop(message: &str) -> Option<Fields> {
+    if !message.contains(crate::firewall::LOG_PREFIX) {
+        return None;
+    }
+    let src_ip = field_value(message, "SRC=").and_then(parse_ip_token);
+    Some(Fields {
+        template: T_FIREWALL_DROP,
+        parser: "firewall",
+        src_ip,
+        action: Some("firewall.drop".into()),
+        outcome: Some("denied".into()),
+        ..Fields::default()
+    })
 }
 
 /// Common/combined HTTP access-log line:
@@ -692,6 +715,20 @@ mod tests {
         assert_eq!(event.method.as_deref(), Some("GET"));
         assert_eq!(event.path.as_deref(), Some("/admin"));
         assert_eq!(event.status, Some(404));
+    }
+
+    #[test]
+    fn firewall_drop_log_line_becomes_det27_evidence() {
+        let rec = record(
+            "rustips-fw-drop IN=eth0 OUT= MAC=00:11 SRC=203.0.113.5 DST=192.0.2.1 LEN=60 PROTO=TCP SPT=40000 DPT=23 WINDOW=64240",
+            "kernel",
+        );
+        let event = event_from_record(&rec, 1024, &[]);
+        assert_eq!(event.template, T_FIREWALL_DROP);
+        assert_eq!(event.parser, "firewall");
+        assert_eq!(event.src_ip, Some("203.0.113.5".parse().unwrap()));
+        assert_eq!(event.action.as_deref(), Some("firewall.drop"));
+        assert_eq!(event.outcome.as_deref(), Some("denied"));
     }
 
     #[test]

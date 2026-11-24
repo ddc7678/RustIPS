@@ -107,7 +107,9 @@ sudo systemctl start rustips
 sudo rustips check && sudo rustips status
 ```
 
-Database migrations run automatically on first open (schema v10 since 0.3.13) inside
+Database migrations run automatically on first open (schema v12 adds admin-drop
+and discovered-service tables; v11 added the DET-27 firewall rule; v10 since
+0.3.13 added resource samples) inside
 an immediate transaction. Back up `/var/lib/rustips/rustips.db` before a manual
 upgrade. To roll back, stop the service, restore `rustips.prev` and the backup
 DB if the downgrade refuses the schema, then start it.

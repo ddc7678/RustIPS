@@ -17,7 +17,7 @@ use crate::model::{Actor, AllowlistEntry, Block, BlockState, Detection, Detector
 use crate::net::{self, Cidr};
 use crate::rules::{Rule, RuleRevision};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 12;
 
 /// `(timestamp, actor, action, subject)` for the recent-activity view.
 pub type AuditRow = (DateTime<Utc>, String, String, String);
@@ -46,6 +46,36 @@ pub struct AlertJob {
 }
 
 /// A persisted webhook destination, editable through the Alerts page.
+/// An administrator-defined firewall drop rule.
+#[derive(Debug, Clone)]
+pub struct AdminDropRow {
+    pub id: i64,
+    /// Canonical CIDR/IP, or `None` for any source.
+    pub src: Option<String>,
+    /// Canonical CIDR/IP, or `None` for any destination.
+    pub dst: Option<String>,
+    /// `any`, `tcp`, `udp`, `icmp` or `icmp6`.
+    pub proto: String,
+    pub port: Option<u16>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub created_by: String,
+}
+
+/// Persistent state for one discovered listening service.
+#[derive(Debug, Clone)]
+pub struct FirewallServiceRow {
+    pub proto: String,
+    pub port: u16,
+    /// `None` is a wildcard bind; otherwise the specific local address.
+    pub addr: Option<IpAddr>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub dropped: bool,
+    pub acknowledged: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AlertTarget {
     pub id: i64,
@@ -387,6 +417,36 @@ impl Db {
                 "#,
             )?;
         }
+        if current < 12 {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE firewall_admin_rules (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    src           TEXT,
+                    dst           TEXT,
+                    proto         TEXT NOT NULL,
+                    port          INTEGER,
+                    enabled       INTEGER NOT NULL DEFAULT 1,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    created_by    TEXT NOT NULL DEFAULT '',
+                    updated_by    TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE firewall_services (
+                    proto          TEXT NOT NULL,
+                    port           INTEGER NOT NULL,
+                    addr           TEXT NOT NULL DEFAULT '',
+                    first_seen_ms  INTEGER NOT NULL,
+                    last_seen_ms   INTEGER NOT NULL,
+                    dropped        INTEGER NOT NULL DEFAULT 0,
+                    acknowledged   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (proto, port, addr)
+                );
+                CREATE INDEX firewall_services_last_seen ON firewall_services(last_seen_ms);
+                "#,
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         if current < 3 {
@@ -416,6 +476,10 @@ impl Db {
             // Retired internal detectors are no longer emitted; remove them
             // from stored rule match lists so the UI matches the catalog.
             let _ = self.strip_retired_detectors()?;
+        }
+        if current < 11 {
+            // Data-only migration for the optional service firewall detector.
+            let _ = self.ensure_firewall_rule()?;
         }
         Ok(())
     }
@@ -1643,6 +1707,19 @@ impl Db {
         )
     }
 
+    pub fn ensure_firewall_rule(&mut self) -> Result<bool> {
+        self.ensure_rule_for_detectors(
+            &["DET-27"],
+            "Firewall default-drop alert",
+            "DET-27: the optional service firewall dropped or rejected an inbound packet. Alert only; the packet is already denied.",
+            160,
+            crate::rules::Severity::Warning,
+            crate::rules::RuleAction::Alert,
+            None,
+            "added for the optional service firewall",
+        )
+    }
+
     /// Remove DET-22/24/25 from stored rule match lists after those detectors
     /// were retired. A rule whose only detectors were retired is disabled
     /// rather than becoming a catch-all.
@@ -2263,6 +2340,188 @@ impl Db {
         self.set_setting("detection.disabled", &serde_json::json!(values))
     }
 
+    // ------------------------------------------------- firewall admin rules
+
+    pub fn firewall_admin_rules(&self) -> Result<Vec<AdminDropRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, src, dst, proto, port, enabled, created_at_ms, updated_at_ms, created_by
+             FROM firewall_admin_rules ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AdminDropRow {
+                id: row.get(0)?,
+                src: row.get(1)?,
+                dst: row.get(2)?,
+                proto: row.get(3)?,
+                port: row.get::<_, Option<i64>>(4)?.map(|port| port as u16),
+                enabled: row.get::<_, i64>(5)? != 0,
+                created_at: from_ms(row.get(6)?),
+                updated_at: from_ms(row.get(7)?),
+                created_by: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn firewall_admin_rule(&self, id: i64) -> Result<Option<AdminDropRow>> {
+        Ok(self
+            .firewall_admin_rules()?
+            .into_iter()
+            .find(|rule| rule.id == id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_firewall_admin_rule(
+        &self,
+        id: i64,
+        src: Option<&str>,
+        dst: Option<&str>,
+        proto: &str,
+        port: Option<u16>,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<i64> {
+        let now = ms(Utc::now());
+        if id == 0 {
+            self.conn.execute(
+                "INSERT INTO firewall_admin_rules
+                 (src, dst, proto, port, enabled, created_at_ms, updated_at_ms, created_by, updated_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7)",
+                params![
+                    src,
+                    dst,
+                    proto,
+                    port.map(i64::from),
+                    enabled as i64,
+                    now,
+                    actor
+                ],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        } else {
+            self.conn.execute(
+                "UPDATE firewall_admin_rules
+                 SET src = ?1, dst = ?2, proto = ?3, port = ?4, enabled = ?5,
+                     updated_at_ms = ?6, updated_by = ?7
+                 WHERE id = ?8",
+                params![
+                    src,
+                    dst,
+                    proto,
+                    port.map(i64::from),
+                    enabled as i64,
+                    now,
+                    actor,
+                    id
+                ],
+            )?;
+            Ok(id)
+        }
+    }
+
+    pub fn set_firewall_admin_rule_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE firewall_admin_rules
+             SET enabled = ?1, updated_at_ms = ?2, updated_by = ?3
+             WHERE id = ?4",
+            params![enabled as i64, ms(Utc::now()), actor, id],
+        )? > 0)
+    }
+
+    pub fn delete_firewall_admin_rule(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM firewall_admin_rules WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    // ---------------------------------------------------- firewall services
+
+    pub fn upsert_firewall_services(
+        &self,
+        services: &[(String, u16, Option<IpAddr>)],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = ms(now);
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO firewall_services
+             (proto, port, addr, first_seen_ms, last_seen_ms, dropped, acknowledged)
+             VALUES (?1, ?2, ?3, ?4, ?4, 0, 0)
+             ON CONFLICT(proto, port, addr) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
+        )?;
+        for (proto, port, addr) in services {
+            stmt.execute(params![
+                proto,
+                *port as i64,
+                addr.map(|addr| addr.to_string()).unwrap_or_default(),
+                now
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn firewall_services(&self) -> Result<Vec<FirewallServiceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT proto, port, addr, first_seen_ms, last_seen_ms, dropped, acknowledged
+             FROM firewall_services ORDER BY port ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let addr_text: String = row.get(2)?;
+            Ok(FirewallServiceRow {
+                proto: row.get(0)?,
+                port: row.get::<_, i64>(1)? as u16,
+                addr: if addr_text.is_empty() {
+                    None
+                } else {
+                    addr_text.parse::<IpAddr>().ok()
+                },
+                first_seen: from_ms(row.get(3)?),
+                last_seen: from_ms(row.get(4)?),
+                dropped: row.get::<_, i64>(5)? != 0,
+                acknowledged: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_firewall_service_dropped(
+        &self,
+        proto: &str,
+        port: u16,
+        addr: Option<IpAddr>,
+        dropped: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE firewall_services
+             SET dropped = ?1, acknowledged = 1
+             WHERE proto = ?2 AND port = ?3 AND addr = ?4",
+            params![
+                dropped as i64,
+                proto,
+                port as i64,
+                addr.map(|addr| addr.to_string()).unwrap_or_default()
+            ],
+        )? > 0)
+    }
+
+    pub fn acknowledge_firewall_services(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("UPDATE firewall_services SET acknowledged = 1", [])?)
+    }
+
+    pub fn prune_firewall_services(&self, before: DateTime<Utc>) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM firewall_services WHERE last_seen_ms < ?1",
+            [ms(before)],
+        )?)
+    }
+
     // --------------------------------------------------------------- maintenance
 
     pub fn prune(&self, cfg: &Config, now: DateTime<Utc>) -> Result<(usize, usize)> {
@@ -2708,7 +2967,7 @@ mod tests {
     fn rules_seed_save_history_and_delete() {
         let (db, dir) = temp_db();
         let seeded = db.list_rules().unwrap();
-        assert_eq!(seeded.len(), 6);
+        assert_eq!(seeded.len(), 7);
         assert!(db.rules_version().unwrap() >= 1);
         let mut rule = seeded[0].clone();
         let id = rule.id;
@@ -2856,6 +3115,93 @@ mod tests {
             .expect("honeypot rule");
         assert_eq!(added.when.min_count, Some(3));
         assert!(!db.ensure_honeypot_rule().unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn firewall_rule_is_added_to_an_old_rule_set() {
+        let (mut db, dir) = temp_db();
+        let firewall = db
+            .list_rules()
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.name == "Firewall default-drop alert")
+            .unwrap();
+        db.delete_rule(firewall.id, "tester").unwrap();
+        assert!(db.ensure_firewall_rule().unwrap());
+        let added = db
+            .list_rules()
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.when.detectors.iter().any(|id| id == "DET-27"))
+            .expect("firewall rule");
+        assert_eq!(added.action, crate::rules::RuleAction::Alert);
+        assert!(!db.ensure_firewall_rule().unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn firewall_admin_rules_and_services_roundtrip() {
+        let (db, dir) = temp_db();
+        let id = db
+            .save_firewall_admin_rule(
+                0,
+                Some("203.0.113.0/24"),
+                None,
+                "tcp",
+                Some(22),
+                true,
+                "tester",
+            )
+            .unwrap();
+        let rule = db.firewall_admin_rule(id).unwrap().unwrap();
+        assert_eq!(rule.src.as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(rule.port, Some(22));
+        assert!(rule.enabled);
+        assert!(
+            db.set_firewall_admin_rule_enabled(id, false, "tester")
+                .unwrap()
+        );
+        assert!(!db.firewall_admin_rule(id).unwrap().unwrap().enabled);
+        assert!(db.delete_firewall_admin_rule(id).unwrap());
+
+        let socket: IpAddr = "192.0.2.10".parse().unwrap();
+        let start = Utc::now() - chrono::Duration::hours(1);
+        db.upsert_firewall_services(&[("tcp".into(), 22, None)], start)
+            .unwrap();
+        db.upsert_firewall_services(&[("tcp".into(), 22, None)], Utc::now())
+            .unwrap();
+        let service = db
+            .firewall_services()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.proto == "tcp" && row.port == 22)
+            .unwrap();
+        assert!(!service.dropped);
+        assert!(!service.acknowledged);
+        assert!(service.last_seen >= service.first_seen);
+        assert!(
+            db.set_firewall_service_dropped("tcp", 22, None, true)
+                .unwrap()
+        );
+        let service = db
+            .firewall_services()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.proto == "tcp" && row.port == 22)
+            .unwrap();
+        assert!(service.dropped);
+        assert!(service.acknowledged);
+
+        db.upsert_firewall_services(&[("tcp".into(), 443, Some(socket))], Utc::now())
+            .unwrap();
+        assert_eq!(db.acknowledge_firewall_services().unwrap(), 2);
+        assert!(
+            db.firewall_services()
+                .unwrap()
+                .iter()
+                .all(|row| row.acknowledged)
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3091,7 +3437,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(db.list_rules().unwrap().len(), 6 + samples.len());
+        assert_eq!(db.list_rules().unwrap().len(), 7 + samples.len());
         std::fs::remove_dir_all(dir).ok();
     }
 

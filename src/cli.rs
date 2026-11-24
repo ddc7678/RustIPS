@@ -915,6 +915,40 @@ fn cmd_check(layout: &Layout) -> Result<()> {
         }
     }
 
+    let firewall_settings = Db::open(&layout.db)
+        .ok()
+        .map(|db| crate::firewall::settings(&db, &cfg))
+        .unwrap_or_else(|| cfg.firewall.clone());
+    if firewall_settings.enabled {
+        println!(
+            "firewall: enabled (discover={}, refresh={}s, log_drops={}, action={})",
+            firewall_settings.discover_services,
+            firewall_settings.refresh_secs,
+            firewall_settings.log_drops,
+            if firewall_settings.reject {
+                "reject"
+            } else {
+                "drop"
+            }
+        );
+        if firewall_settings.discover_services {
+            match crate::firewall::discover() {
+                Ok(sockets) => {
+                    println!("firewall: {} listening socket(s) discovered", sockets.len())
+                }
+                Err(e) => {
+                    println!("firewall: FAIL: service discovery: {e}");
+                    problems += 1;
+                }
+            }
+        }
+        if cfg.mode != Mode::Enforce {
+            println!("firewall: WARNING: enabled but the daemon is in observe mode");
+        }
+    } else {
+        println!("firewall: disabled (optional service firewall)");
+    }
+
     if cfg.mode == Mode::Enforce {
         if is_root() {
             println!("privilege: root (enough to capture and enforce)");

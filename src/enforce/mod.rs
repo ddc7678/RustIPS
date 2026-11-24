@@ -10,8 +10,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::firewall::{FirewallPlan, LOG_PREFIX};
 
 pub trait Enforcer: Send + Sync {
     /// Create table/chain/sets if missing. Idempotent.
@@ -20,6 +22,9 @@ pub trait Enforcer: Send + Sync {
     fn remove(&self, ip: IpAddr) -> Result<()>;
     /// Replace the blocked set atomically (startup reconciliation).
     fn restore(&self, ips: &[IpAddr]) -> Result<()>;
+    /// Replace the optional service-allow/default-drop layer. A plan with
+    /// `enabled = false` restores the always-on blocked-source-only chain.
+    fn apply_firewall(&self, plan: &FirewallPlan) -> Result<()>;
     /// Remove all RustIPS state from the kernel.
     fn flush(&self) -> Result<()>;
     fn available(&self) -> bool;
@@ -31,6 +36,11 @@ pub struct NftEnforcer {
     hook: String,
     priority: i32,
     bin: PathBuf,
+    /// Last successfully applied optional firewall plan, used by `ensure` to
+    /// repair drift without re-writing the chain on every check.
+    firewall_plan: Mutex<Option<FirewallPlan>>,
+    /// Serialise every `nft -f -` invocation from concurrent threads.
+    script_lock: Mutex<()>,
 }
 
 impl NftEnforcer {
@@ -45,6 +55,8 @@ impl NftEnforcer {
             hook: hook.to_string(),
             priority,
             bin,
+            firewall_plan: Mutex::new(None),
+            script_lock: Mutex::new(()),
         }
     }
 
@@ -69,6 +81,10 @@ impl NftEnforcer {
     }
 
     fn script(&self, script: &str) -> Result<()> {
+        let _guard = self
+            .script_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut child = Command::new(&self.bin)
             .arg("-f")
             .arg("-")
@@ -93,6 +109,111 @@ impl NftEnforcer {
             "nft rejected the transaction: {}",
             stderr.trim()
         )))
+    }
+
+    /// Build the full chain contents. Blocked sources always win, then the
+    /// optional service/default-deny layer is appended.
+    fn firewall_script(&self, plan: &FirewallPlan) -> String {
+        let t = &self.table;
+        let hook = &self.hook;
+        let mut script = format!("flush chain inet {t} {hook}\n");
+        script.push_str(&format!(
+            "add rule inet {t} {hook} ip saddr @blocked_v4 drop\n\
+             add rule inet {t} {hook} ip6 saddr @blocked_v6 drop\n"
+        ));
+        if !plan.enabled {
+            return script;
+        }
+
+        // Never break replies to connections this host initiated, and keep
+        // loopback (the UI, local services) working.
+        // Loopback is accepted before admin drops so a bad source/destination
+        // rule cannot lock the administrator out of the local UI.
+        script.push_str(&format!("add rule inet {t} {hook} iif \"lo\" accept\n"));
+        for rule in &plan.drops {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(src) = rule.src {
+                let family = if src.addr.is_ipv4() { "ip" } else { "ip6" };
+                parts.push(format!("{family} saddr {src}"));
+            }
+            if let Some(dst) = rule.dst {
+                let family = if dst.addr.is_ipv4() { "ip" } else { "ip6" };
+                parts.push(format!("{family} daddr {dst}"));
+            }
+            if let Some(port) = rule.port {
+                if rule.proto.has_port() {
+                    parts.push(format!("{} dport {port}", rule.proto.as_str()));
+                }
+            } else {
+                match rule.proto {
+                    crate::firewall::DropProto::Any => {}
+                    crate::firewall::DropProto::Tcp => parts.push("meta l4proto tcp".into()),
+                    crate::firewall::DropProto::Udp => parts.push("meta l4proto udp".into()),
+                    crate::firewall::DropProto::Icmp => parts.push("meta l4proto icmp".into()),
+                    crate::firewall::DropProto::Icmp6 => {
+                        parts.push("meta l4proto ipv6-icmp".into())
+                    }
+                }
+            }
+            let matcher = if parts.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", parts.join(" "))
+            };
+            script.push_str(&format!(
+                "add rule inet {t} {hook} {matcher}drop comment \"rustips-fw-admin\"\n"
+            ));
+        }
+        script.push_str(&format!(
+            "add rule inet {t} {hook} ct state established,related accept\n"
+        ));
+        // IPv6 needs neighbour discovery and router advertisements, and DHCP
+        // clients need their server replies; without these the host can lose
+        // connectivity even though its services are allowed.
+        script.push_str(&format!(
+            "add rule inet {t} {hook} icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }} accept\n\
+             add rule inet {t} {hook} udp sport 67 udp dport 68 accept\n\
+             add rule inet {t} {hook} udp sport 547 udp dport 546 accept\n"
+        ));
+
+        for proto in [crate::model::Proto::Tcp, crate::model::Proto::Udp] {
+            let mut groups: std::collections::BTreeMap<Option<IpAddr>, Vec<u16>> =
+                std::collections::BTreeMap::new();
+            for rule in plan.allow.iter().filter(|rule| rule.proto == proto) {
+                groups.entry(rule.addr).or_default().push(rule.port);
+            }
+            for (addr, mut ports) in groups {
+                ports.sort_unstable();
+                ports.dedup();
+                let list = ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let prefix = match addr {
+                    None => String::new(),
+                    Some(ip) if ip.is_ipv4() => format!("ip daddr {ip} "),
+                    Some(ip) => format!("ip6 daddr {ip} "),
+                };
+                script.push_str(&format!(
+                    "add rule inet {t} {hook} {prefix}{} dport {{ {list} }} accept\n",
+                    proto.as_str()
+                ));
+            }
+        }
+
+        if plan.log_drops {
+            // Bound journal volume; the detector still sees a usable sample.
+            script.push_str(&format!(
+                "add rule inet {t} {hook} limit rate 10/second burst 20 packets \
+                 log prefix \"{LOG_PREFIX} \" level warn\n"
+            ));
+        }
+        let verb = if plan.reject { "reject" } else { "drop" };
+        script.push_str(&format!(
+            "add rule inet {t} {hook} {verb} comment \"rustips-fw\"\n"
+        ));
+        script
     }
 }
 
@@ -154,6 +275,29 @@ impl Enforcer for NftEnforcer {
         }
         if !rules.is_empty() {
             self.script(&rules)?;
+        }
+
+        // Repair a chain that was flushed or edited out-of-band while the
+        // optional firewall layer is enabled.
+        let plan = self
+            .firewall_plan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(plan) = plan {
+            if plan.enabled {
+                let listing = self
+                    .run(&["list", "chain", "inet", t, &self.hook])
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                let has_deny = listing.contains("comment \"rustips-fw\"");
+                let has_log = !plan.log_drops || listing.contains(LOG_PREFIX);
+                let has_drops =
+                    plan.drops.is_empty() || listing.contains("comment \"rustips-fw-admin\"");
+                if !has_deny || !has_log || !has_drops {
+                    self.script(&self.firewall_script(&plan))?;
+                }
+            }
         }
         Ok(())
     }
@@ -218,6 +362,19 @@ impl Enforcer for NftEnforcer {
         self.script(&script)
     }
 
+    fn apply_firewall(&self, plan: &FirewallPlan) -> Result<()> {
+        let mut last = self
+            .firewall_plan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if last.as_ref() == Some(plan) {
+            return Ok(());
+        }
+        self.script(&self.firewall_script(plan))?;
+        *last = Some(plan.clone());
+        Ok(())
+    }
+
     fn flush(&self) -> Result<()> {
         if !self.exists(&["list", "table", "inet", &self.table]) {
             return Ok(());
@@ -262,6 +419,19 @@ impl Enforcer for DryRunEnforcer {
         tracing::info!(count = ips.len(), "observe mode: would restore blocked set");
         Ok(())
     }
+    fn apply_firewall(&self, plan: &FirewallPlan) -> Result<()> {
+        if plan.enabled {
+            tracing::info!(
+                allow_rules = plan.allow_count(),
+                log_drops = plan.log_drops,
+                reject = plan.reject,
+                "observe mode: would apply the service firewall"
+            );
+        } else {
+            tracing::info!("observe mode: would disable the service firewall");
+        }
+        Ok(())
+    }
     fn flush(&self) -> Result<()> {
         tracing::info!("observe mode: would flush");
         Ok(())
@@ -271,5 +441,95 @@ impl Enforcer for DryRunEnforcer {
     }
     fn describe(&self) -> String {
         "observe mode (no enforcement)".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::firewall::{AllowRule, DropProto, DropRule};
+    use crate::model::Proto;
+    use crate::net::Cidr;
+
+    #[test]
+    fn firewall_script_orders_blocks_allows_and_final_log_drop() {
+        let enforcer = NftEnforcer::new("rustips", "input", -10);
+        let plan = FirewallPlan {
+            enabled: true,
+            allow: vec![
+                AllowRule {
+                    proto: Proto::Tcp,
+                    port: 22,
+                    addr: None,
+                },
+                AllowRule {
+                    proto: Proto::Tcp,
+                    port: 443,
+                    addr: Some("192.0.2.5".parse().unwrap()),
+                },
+                AllowRule {
+                    proto: Proto::Udp,
+                    port: 53,
+                    addr: None,
+                },
+            ],
+            drops: vec![DropRule {
+                src: Some(Cidr::parse("203.0.113.0/24").unwrap()),
+                dst: None,
+                proto: DropProto::Tcp,
+                port: Some(22),
+            }],
+            log_drops: true,
+            reject: false,
+        };
+        let script = enforcer.firewall_script(&plan);
+        let blocked = script.find("blocked_v4 drop").unwrap();
+        let loopback = script.find("iif \"lo\" accept").unwrap();
+        let admin = script
+            .find("ip saddr 203.0.113.0/24 tcp dport 22 drop comment \"rustips-fw-admin\"")
+            .unwrap();
+        let established = script.find("ct state established,related accept").unwrap();
+        let tcp = script.find("tcp dport { 22 } accept").unwrap();
+        let tcp_addr = script
+            .find("ip daddr 192.0.2.5 tcp dport { 443 } accept")
+            .unwrap();
+        let udp = script.find("udp dport { 53 } accept").unwrap();
+        assert!(script.contains("icmpv6 type { nd-neighbor-solicit"));
+        assert!(script.contains("udp sport 67 udp dport 68 accept"));
+        assert!(script.contains("udp sport 547 udp dport 546 accept"));
+        let log = script.find(LOG_PREFIX).unwrap();
+        let drop = script.find("drop comment \"rustips-fw\"").unwrap();
+        assert!(blocked < loopback);
+        assert!(loopback < admin);
+        assert!(admin < established);
+        assert!(established < tcp);
+        assert!(tcp < tcp_addr);
+        assert!(tcp_addr < udp);
+        assert!(udp < log);
+        assert!(log < drop);
+    }
+
+    #[test]
+    fn disabled_plan_only_keeps_blocked_sources() {
+        let enforcer = NftEnforcer::new("rustips", "input", -10);
+        let script = enforcer.firewall_script(&FirewallPlan::default());
+        assert!(script.contains("blocked_v4 drop"));
+        assert!(!script.contains("rustips-fw"));
+        assert!(!script.contains("ct state established"));
+    }
+
+    #[test]
+    fn reject_plan_uses_reject_and_still_logs() {
+        let enforcer = NftEnforcer::new("rustips", "input", -10);
+        let plan = FirewallPlan {
+            enabled: true,
+            allow: Vec::new(),
+            drops: Vec::new(),
+            log_drops: true,
+            reject: true,
+        };
+        let script = enforcer.firewall_script(&plan);
+        assert!(script.contains(LOG_PREFIX));
+        assert!(script.contains("reject comment \"rustips-fw\""));
     }
 }
